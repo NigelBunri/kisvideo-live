@@ -1,0 +1,208 @@
+# MediaMTX config for kisvideo-live — self-hosted RTMP+WHIP ingest, HLS
+# playback, replacing Mux's live-streaming API for KISTube.
+#
+# Keys verified directly against the real default mediamtx.yml shipped in
+# bluenviron/mediamtx (main branch, fetched 2026-09-22) rather than assumed
+# from memory — notably runOnReady/runOnNotReady do NOT exist in current
+# MediaMTX (that naming is from the older rtsp-simple-server lineage); the
+# real per-path hooks for "a publisher started/stopped sending" are
+# runOnAvailable/runOnUnavailable, used below.
+
+# ─── Control API ────────────────────────────────────────────────────────────
+# Used by app/mediamtx_client.py to kick a publisher (DELETE /streams/{id})
+# and to look up a path's active connection before kicking it. Not exposed
+# outside this box — only the control-plane API container talks to it, over
+# the docker-compose internal network / localhost.
+api: true
+apiAddress: :9997
+
+# MediaMTX's own built-in default (verified against the real
+# bluenviron/mediamtx main mediamtx.yml, not assumed) restricts the `api`
+# action to ips: ["127.0.0.1", "::1"] — which is the CONTROL API'S OWN
+# process, not this file's `api` FastAPI service one container over. A
+# real local run caught this: mediamtx_client.py's calls from the `api`
+# container got a genuine 401 (confirmed via direct in-container httpx
+# call, not assumed), silently making kick_publisher()/path lookups
+# always fail — DELETE /streams still returned 200 (best-effort, per its
+# own docstring) but never actually kicked a stale publisher.
+#
+# Specifying authInternalUsers at all REPLACES MediaMTX's entire built-in
+# default list, not merges with it — so the first entry below (unchanged
+# from upstream: unauthenticated publish/read/playback for any IP) MUST
+# stay, or RTMP/WHIP ingest and HLS/WHIP playback would silently start
+# requiring auth too. Only the second entry's `ips` is changed, from
+# localhost-only to unrestricted — acceptable because this API is never
+# reachable from outside this compose network in the first place (no host
+# port published for 9997 anywhere in docker-compose.yml/prod.yml); IP
+# restriction here would be a second, weaker copy of a boundary Docker's
+# own networking already enforces.
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+        path:
+      - action: read
+        path:
+      - action: playback
+        path:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: api
+      - action: metrics
+      - action: pprof
+
+# ─── RTMP ingest ────────────────────────────────────────────────────────────
+# External RTMP (OBS) ingest path for LiveControlRoom.tsx's non-in-app-camera
+# flow. Plain rtmp:// (not rtmps://) — this box terminates TLS at Caddy for
+# HTTP-based protocols (HLS/WHIP) only; RTMP has no browser-facing TLS
+# requirement the way WHIP does, and OBS/ffmpeg publishers work fine with
+# an unencrypted RTMP-over-the-open-internet stream key model (same
+# trust model Mux's own rtmps://global-live.mux.com used a *stream key*,
+# not a client cert, to authenticate — the analogous protection here is
+# the unguessable per-stream key baked into the path name itself).
+rtmp: true
+rtmpAddress: :1935
+
+# ─── WHIP ingest / WebRTC ───────────────────────────────────────────────────
+# LiveControlRoom.tsx's in-app camera capture path publishes here via WHIP
+# (POST to https://<host>:8889/live/<key>/whip). webrtcEncryption is left
+# false here because Caddy (see docker-compose.prod.yml) terminates TLS in
+# front of this port in production — browsers require HTTPS for WHIP, so
+# the *public* URL handed back by POST /streams must be https://, even
+# though MediaMTX itself speaks plain HTTP behind the proxy.
+webrtc: true
+webrtcAddress: :8889
+webrtcAllowOrigins: ["*"]
+# WHIP signaling (the SDP offer/answer POST) succeeds without this - the
+# actual media (RTP/ICE/DTLS, UDP) doesn't. MediaMTX's own default
+# (webrtcIPsFromInterfaces: true) advertises IPs gathered from its own
+# network interfaces as ICE candidates - since this runs inside a Docker
+# container, that's the container's internal bridge-network IP
+# (172.x.x.x), unreachable from any real client outside this box. Caught
+# by an actual ffmpeg WHIP publish attempt (real SDP exchange succeeded,
+# then "Connection refused" trying to establish the actual media
+# connection) - not something an OPTIONS/HTTP-only check would ever
+# surface. Hardcoded rather than templated from an env var - MediaMTX's
+# own docs only document $VAR-style substitution inside runOnX
+# shell-command strings specifically (verified against the real
+# mediamtx.yml/README), not as a general feature available to arbitrary
+# config values like this one; guessing that it also worked here risked
+# repeating the exact kind of unverified-syntax mistake that broke this
+# file once already (the runOnAvailable YAML-quoting bug). A literal IP
+# is simple and certain to work for this single-box MVP deployment -
+# update this value if the box is ever migrated to a different IP.
+webrtcAdditionalHosts: [3.9.115.89]
+# Confirmed via a raw SDP offer/answer test against the real deployed
+# service (not assumed): MediaMTX's default webrtcIPsFromInterfaces:true
+# was ALSO advertising 127.0.0.1 and the container's internal Docker IP
+# (172.20.0.x) as candidates alongside the real public one above. A real
+# ffmpeg WHIP publish attempt failed fast (~1s, "Connection refused") in
+# a way consistent with its ICE client trying the 127.0.0.1 candidate
+# first and getting an immediate local rejection (nothing listens on the
+# CLIENT's own port 8189) rather than properly falling back to the
+# working public candidate. Disabling interface-gathering so only the
+# explicit, correct candidate above is ever offered removes the
+# confusing/invalid ones entirely rather than relying on every client's
+# ICE implementation to skip them correctly.
+webrtcIPsFromInterfaces: false
+
+# ─── HLS playback ───────────────────────────────────────────────────────────
+# kistube-website's HlsVideo.tsx (and the mobile app) fetch the master
+# playlist from here. Same TLS-behind-Caddy note as WHIP above.
+hls: true
+hlsAddress: :8888
+# v1 is explicitly passthrough/single-quality (see ARCHITECTURE.md in the
+# KIS_Video ecosystem's live-streaming plan) — MediaMTX's HLS muxer
+# repackages the incoming RTMP/WHIP stream directly with no re-encode,
+# which is exactly what "passthrough" means here; there is no separate
+# transcoding step to configure.
+#
+# fmp4, not mpegts: a real WHIP publish test against the deployed service
+# (not assumed) surfaced that mpegts HLS only supports MPEG-4 (AAC) audio
+# - WHIP/WebRTC ingest always negotiates Opus (the WebRTC-mandated audio
+# codec), so every WHIP-sourced stream's HLS playback failed outright
+# ("the MPEG-TS variant of HLS supports MPEG-4 Audio only"), while
+# RTMP-sourced streams (AAC audio, e.g. OBS/LiveControlRoom.tsx's
+# external-RTMP path) worked fine under mpegts - the gap only showed up
+# once both ingest paths were actually tested, not just one. fmp4
+# supports both codecs, so both ingest paths produce working HLS output.
+hlsVariant: fmp4
+hlsSegmentCount: 7
+hlsSegmentDuration: 2s
+hlsPartDuration: 500ms
+hlsAllowOrigins: ["*"]
+
+# ─── Paths ───────────────────────────────────────────────────────────────
+# No pre-registration: any path under the implicit wildcard is accepted,
+# since app/main.py's POST /streams hands out an opaque per-stream key as
+# the path name (e.g. "live/<key>") rather than Django pre-declaring paths
+# here. runOnAvailable/runOnUnavailable fire once per publish/unpublish —
+# NOT runOnRead/runOnUnread, which fire per *viewer* connect/disconnect and
+# would be the wrong signal for "is this stream live."
+paths:
+  all_others:
+    # $MTX_PATH is the path name (e.g. "live/<key>") MediaMTX substitutes
+    # in verbatim — see app/main.py's POST /hooks/ready and /hooks/not-ready
+    # for what happens on the receiving end. KISVIDEO_LIVE_CONTROL_URL is
+    # exported into this process's own environment (docker-compose.yml /
+    # docker-compose.prod.yml), not a MediaMTX-provided variable — needed
+    # here because MediaMTX has no native "hook target base URL" setting,
+    # only a raw shell command per hook.
+    # -H carries $KISVIDEO_LIVE_HOOK_SECRET so app/deps.py::require_hook_secret
+    # can tell these calls apart from arbitrary traffic (see app/main.py's
+    # hook endpoints). The whole command MUST be single-quoted here, not
+    # left bare or double-quoted - an unquoted "X-Hook-Secret: $VAR" value
+    # containing ": " (colon-space) is invalid YAML at the top level
+    # (parsed as a nested mapping key, not a string), which broke MediaMTX
+    # startup entirely until this was caught by an actual local run
+    # (`mapping value is not allowed in this context`, pointing right at
+    # this line) - not something a syntax-only read-through would catch.
+    runOnAvailable: 'curl -fsS -X POST -H "X-Hook-Secret: $KISVIDEO_LIVE_HOOK_SECRET" "$KISVIDEO_LIVE_CONTROL_URL/hooks/ready?path=$MTX_PATH"'
+    runOnAvailableRestart: false
+    runOnUnavailable: 'curl -fsS -X POST -H "X-Hook-Secret: $KISVIDEO_LIVE_HOOK_SECRET" "$KISVIDEO_LIVE_CONTROL_URL/hooks/not-ready?path=$MTX_PATH"'
+
+    # --- Automatic recording (KIS Priority C) ---------------------------
+    # Native MediaMTX recording of the SAME already-clean path the HLS
+    # muxer reads (app/ingest_proxy.py's own re-encode, not the
+    # broadcaster's raw encoder output - see that module's docstring for
+    # why that matters for the live muxer; it applies equally here since
+    # this is the identical track data, just written to disk instead of
+    # packaged as HLS). No transcoding, no extra CPU beyond disk I/O -
+    # confirmed as the correct reading of MediaMTX v1.21.1's own docs
+    # (fetched and verified against the real tag, not assumed) before
+    # enabling this.
+    record: yes
+    # /recordings is a volume shared with the api container (see
+    # docker-compose.prod.yml) - app/recording.py reads these files to
+    # concatenate/validate/upload, the mediamtx container itself never
+    # talks to S3 or Django directly.
+    recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+    recordFormat: fmp4
+    recordPartDuration: 2s
+    recordMaxPartSize: 50M
+    # Sized so a typical broadcast (well under this) produces exactly ONE
+    # segment file - app/recording.py only needs to ffmpeg-concat
+    # (cheap, stream-copy) when a stream genuinely runs longer than this.
+    # Confirmed 17GB free disk on this box at implementation time, not a
+    # guess - this bounds worst-case single-segment size, independent of
+    # recordDeleteAfter below (that's the backstop for segments nothing
+    # ever picks up, not the primary sizing control).
+    recordSegmentDuration: 2h
+    # Safety net, not the primary cleanup path - app/recording.py deletes
+    # each segment immediately once it has been durably uploaded (or
+    # given up on, after logging the failure). This exists for the case
+    # that process crashes before reaching that cleanup at all, so
+    # abandoned segments don't accumulate on a box that's already tight
+    # on disk.
+    recordDeleteAfter: 24h
+    # Query-string, matching runOnAvailable/runOnUnavailable above (not
+    # --data-urlencode/form body) - MTX_SEGMENT_PATH is built entirely
+    # from recordPath above, which only ever contains URL-safe
+    # characters (the %path component is "live/<token_urlsafe key>",
+    # confirmed against app/main.py::create_stream - no spaces, no "&"
+    # or "?", nothing a raw query string can't carry safely).
+    runOnRecordSegmentComplete: 'curl -fsS -X POST -H "X-Hook-Secret: $KISVIDEO_LIVE_HOOK_SECRET" "$KISVIDEO_LIVE_CONTROL_URL/hooks/record-segment-complete?path=$MTX_PATH&segment=$MTX_SEGMENT_PATH"'

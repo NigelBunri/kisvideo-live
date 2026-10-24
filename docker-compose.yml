@@ -1,0 +1,33 @@
+services:
+  mediamtx:
+    build:
+      context: .
+      dockerfile: Dockerfile.mediamtx
+    ports:
+      - "1935:1935"   # RTMP ingest
+      - "8889:8889"   # WHIP / WebRTC
+      - "8888:8888"   # HLS playback
+      # 9997 (control API) intentionally NOT published to the host - only
+      # the api container (same compose network, reached as
+      # http://mediamtx:9997) needs it.
+    environment:
+      # Substituted into mediamtx.yml's runOnAvailable/runOnUnavailable
+      # hook commands as $KISVIDEO_LIVE_CONTROL_URL - "api" is this
+      # compose file's own service name for the control plane below.
+      - KISVIDEO_LIVE_CONTROL_URL=http://api:8000
+      # ${HOOK_SHARED_SECRET} comes from this directory's .env - the same
+      # file api's env_file below loads (pydantic settings field
+      # hook_shared_secret), via Compose's own automatic .env
+      # interpolation for the compose file itself (not env_file, which
+      # only injects into a container, not into compose YAML values).
+      - KISVIDEO_LIVE_HOOK_SECRET=${HOOK_SHARED_SECRET}
+
+  api:
+    build: .
+    ports:
+      - "8011:8000"   # kisvideo (VOD)'s own local dev port is 8010 - one
+                       # digit up avoids a collision if both services run
+                       # side by side on the same machine.
+    env_file: .env
+    depends_on:
+      - mediamtx

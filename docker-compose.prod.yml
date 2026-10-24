@@ -1,0 +1,153 @@
+# Production deployment — runs on the EXISTING kis-production box
+# (3.9.115.89), NOT a dedicated server. Architecture decision (superseding
+# an earlier "new dedicated box" plan): a second server was ruled out for
+# this MVP; this stack must coexist with Django/Nest/Postgres/Redis/
+# kisvideo-VOD on the same 2-CPU/3.7GB machine instead. Confirmed via
+# direct inspection (2026-09-22, `free -h`/`nproc`/`docker stats`): ~1.5GB
+# "available" memory, 2 CPU cores total, real headroom but not generous —
+# see resource limits below, sized against those real numbers, not a
+# guess.
+#
+# No Caddy here (an earlier draft of this file assumed one) — the box's
+# actual edge proxy is nginx+certbot (confirmed by reading
+# /etc/nginx/sites-available/kis directly), already fronting
+# api.kingdomimpactventures.org/chat.kingdomimpactventures.org/
+# kisauth.kingdomimpactventures.org with one shared certbot cert bundle.
+# MediaMTX's WHIP/HLS ports are fronted by that same nginx (new server
+# blocks/ports added there, not a second TLS terminator competing for
+# 80/443) — see the nginx snippet this repo ships for review before it's
+# applied to the live config.
+#
+# The control API is NOT publicly exposed at all: Django and this stack
+# now run on the same host, so `api` joins the same external
+# `kis-production-network` bridge Django/kisvideo-VOD already use
+# (confirmed via `docker network ls` + `docker inspect kis-django`) and is
+# reached by container-name DNS, exactly like kisvideo(VOD)'s own
+# docker-compose.prod.yml already does for the same reason. No host port,
+# no TLS needed for this hop, no nginx route needed for it either.
+#
+# IMPORTANT alias collision this file deliberately avoids: kisvideo(VOD)'s
+# own container is already registered on kis-production-network under the
+# alias "api" (confirmed via `docker inspect kis-video-api` — its
+# Aliases are ["kis-video-api", "api"]). If this service's "api" service
+# also registered the bare alias "api" on that SAME external network,
+# Docker's embedded DNS would round-robin between two completely
+# unrelated services — Django could resolve "api" to either one
+# unpredictably. The explicit `aliases:` override below on the external
+# network is not optional.
+services:
+  mediamtx:
+    build:
+      context: .
+      dockerfile: Dockerfile.mediamtx
+    container_name: kisvideo-live-mediamtx
+    restart: unless-stopped
+    ports:
+      # RTMP has no TLS requirement (see mediamtx.yml's own comment) and
+      # real broadcasters (OBS, LiveControlRoom.tsx's external-RTMP path)
+      # connect directly — this is the only port this stack exposes on
+      # every interface.
+      - "1935:1935"
+      # WHIP and HLS are bound to loopback only, on DIFFERENT host ports
+      # than their public numbers (18889/18888, not 8889/8888) — nginx
+      # itself is the public listener on 8889/8888 (0.0.0.0, since
+      # browsers connect there directly), and a wildcard bind on a port
+      # blocks any same-port bind on a specific address too, so reusing
+      # 8889/8888 here for the loopback-only container port collided with
+      # nginx at deploy time (`address already in use`, caught by an
+      # actual `docker compose up` run against production, not assumed).
+      # nginx's proxy_pass targets in nginx-live-streaming.conf.snippet
+      # point at these same 18889/18888 numbers — keep them in sync.
+      - "127.0.0.1:18889:8889"
+      - "127.0.0.1:18888:8888"
+      # WebRTC/ICE media (RTP/DTLS/SRTP), UDP, not proxyable through nginx
+      # the way the WHIP HTTP signaling on 8889 is - the browser/publisher
+      # connects here directly once ICE negotiation (via the 8889 HTTP
+      # signaling) tells it to. Public on every interface, same as RTMP,
+      # for the same reason (no TLS/HTTP semantics apply to this traffic).
+      # See mediamtx.yml's webrtcAdditionalHosts comment for why this was
+      # needed at all - real WHIP negotiation testing (not just an HTTP
+      # check) is what surfaced this requirement.
+      - "8189:8189/udp"
+    environment:
+      - KISVIDEO_LIVE_CONTROL_URL=http://api:8000
+      - KISVIDEO_LIVE_HOOK_SECRET=${HOOK_SHARED_SECRET}
+    volumes:
+      # Recording segments (mediamtx.yml's record*/runOnRecordSegment*
+      # keys) land here; app/recording.py (api container) reads, concats,
+      # validates, and uploads them, then deletes its own copy - mediamtx
+      # itself never talks to S3/Django. A local project volume, not
+      # external like kis-production-network - only shared between these
+      # two services in THIS compose project.
+      - kisvideo-recordings:/recordings
+    deploy:
+      resources:
+        limits:
+          # Passthrough only (no re-encode — see mediamtx.yml/app/relay.py)
+          # so this is bandwidth-bound, not CPU-bound. Same
+          # deploy.resources.limits mechanism kisvideo(VOD)'s own prod
+          # compose file already uses on this exact box and is confirmed
+          # actually enforced there (`docker stats` shows kis-video-worker
+          # capped at its configured 512MiB), so this isn't an unproven
+          # mechanism on this host. Recording itself (native MediaMTX
+          # disk write, no transcode) doesn't change this - still
+          # bandwidth/disk-IO bound, not CPU-bound.
+          cpus: "0.5"
+          memory: 256M
+
+  api:
+    build: .
+    container_name: kisvideo-live-api
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      # app/ingest_proxy.py's own per-stream RTMP-listen port pool - each
+      # port here MUST also be published below AND allowed through the
+      # Lightsail firewall (Networking tab), or a broadcaster's OBS will
+      # never reach it. One port today (one real-time ultrafast x264
+      # encode fits this container's 1.0 CPU limit, per the comment
+      # below) - grow this list, the ports: section below, AND the CPU
+      # limit together, never just one of the three.
+      - INGEST_PROXY_PORTS=19350
+    ports:
+      - "19350:19350"
+    depends_on:
+      - mediamtx
+    networks:
+      default: {}
+      kis-production-network:
+        aliases:
+          - kisvideo-live-api
+    volumes:
+      - kisvideo-recordings:/recordings
+    deploy:
+      resources:
+        limits:
+          # Includes the ffmpeg simulcast-relay subprocesses
+          # (app/relay.py, stream-copy, cheap), the ingest proxy
+          # (app/ingest_proxy.py, a real libx264 re-encode per concurrent
+          # stream), AND NOW app/recording.py's finalize pipeline (ffmpeg
+          # concat - stream-copy, cheap like the relay, not a re-encode -
+          # plus ffprobe validation and an S3 upload) - all spawn/run
+          # INSIDE this container, sharing its cgroup, not separate
+          # containers. Memory raised slightly (640M -> 768M) for the
+          # concat/upload's file buffering headroom; CPU deliberately
+          # held at 1.0 - concat is stream-copy, not a second encode, so
+          # it doesn't compete with the ingest proxy's own CPU budget the
+          # way a transcode would. This box only has 2 cores total and
+          # Django/Nest/Postgres/Redis/Celery all share the other one;
+          # 1.0 is the most this service takes before a live stream
+          # risks visibly slowing everything else down. Revisit together
+          # with the box's own vCPU count AND INGEST_PROXY_PORTS above
+          # once concurrent stream volume grows past what one core
+          # covers - adding ports without adding CPU just lets more
+          # streams start than this box can actually encode in real time.
+          cpus: "1.0"
+          memory: 768M
+
+volumes:
+  kisvideo-recordings:
+
+networks:
+  kis-production-network:
+    external: true

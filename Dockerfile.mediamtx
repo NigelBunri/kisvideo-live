@@ -1,0 +1,15 @@
+# The official bluenviron/mediamtx image is FROM scratch (see its
+# docker/standard.Dockerfile) — just the static Go binary, no shell, no
+# curl. mediamtx.yml's runOnAvailable/runOnUnavailable hooks shell out to
+# curl to call this service's /hooks/ready and /hooks/not-ready — that
+# would silently fail (nothing to exec) against the bare official image,
+# so this multi-stage build lifts the real binary out of it onto a small
+# base that actually has curl.
+FROM bluenviron/mediamtx:latest AS mediamtx-bin
+
+FROM alpine:3.20
+RUN apk add --no-cache curl ca-certificates
+COPY --from=mediamtx-bin /mediamtx /usr/local/bin/mediamtx
+COPY mediamtx.yml /mediamtx.yml
+ENTRYPOINT ["mediamtx"]
+CMD ["/mediamtx.yml"]

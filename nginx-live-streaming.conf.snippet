@@ -1,0 +1,90 @@
+# NOT YET APPLIED — draft for review before touching the live nginx config.
+#
+# Appends to (does NOT replace or modify) /etc/nginx/sites-available/kis on
+# kis-production. These are two brand-new `server` blocks on their own
+# ports (8889, 8888) — the EXISTING api.kingdomimpactventures.org server
+# block on :443 (the one fronting Django) is untouched. nginx routes
+# purely on listen+server_name, so adding new listen-port blocks cannot
+# affect the existing :443 routing.
+#
+# Why new ports on the SAME domain rather than a new subdomain: a new
+# subdomain would need a DNS record (nobody has created one, and this
+# session has no DNS/registrar access) before certbot could even attempt
+# an ACME HTTP-01 challenge for it. Reusing api.kingdomimpactventures.org
+# needs neither — it already resolves to this box and already has a valid
+# cert covering it (the shared /etc/letsencrypt/live/kingdomimpactventures.org/
+# bundle every existing server block in this file already uses).
+#
+# Why separate server blocks per port instead of one block listening on
+# both: nginx applies a server block's `location`s uniformly to every
+# `listen` it matches — there's no way to make one location proxy_pass
+# differently depending on which of two ports in the same block a request
+# arrived on. Two blocks, one upstream each, is the correct/only clean way
+# to do this.
+#
+# RTMP (1935) needs no nginx entry at all — it's a raw TCP protocol nginx's
+# stream module isn't configured for here, and MediaMTX's docker-compose
+# port binding (0.0.0.0:1935) already exposes it directly; browsers have
+# no TLS requirement for RTMP the way they do for WHIP.
+
+server {
+    listen 8889 ssl;
+    server_name api.kingdomimpactventures.org;
+
+    ssl_certificate /etc/letsencrypt/live/kingdomimpactventures.org/fullchain.pem; # reuses the existing cert — do not run certbot again for this
+    ssl_certificate_key /etc/letsencrypt/live/kingdomimpactventures.org/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    location / {
+        # MediaMTX's WHIP endpoint (mediamtx.yml: webrtcAddress :8889),
+        # published by docker-compose.prod.yml to 127.0.0.1:18889 only (a different port than this block's own public 8889 - nginx is the public listener, mediamtx binds a distinct internal port so the two don't collide) —
+        # not reachable except through this proxy or from the host itself.
+        proxy_pass http://127.0.0.1:18889;
+        proxy_set_header Host api.kingdomimpactventures.org;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        # WHIP is plain HTTP request/response (POST offer, PATCH/DELETE
+        # for session teardown) — NOT a persistent upgrade connection like
+        # a WebSocket, so no Upgrade/Connection headers are needed here.
+        # Actual media (RTP/ICE) flows UDP, directly between the browser
+        # and MediaMTX's own ICE listener — nginx only ever proxies the
+        # SDP signaling exchange. Unverified until a real WHIP publish
+        # test runs (see the live-streaming plan's Phase 7): confirm
+        # MediaMTX doesn't embed its own container-internal address in any
+        # Location/response header in a way that would leak the internal
+        # hostname to the browser instead of a client-reachable one.
+    }
+}
+
+server {
+    listen 8888 ssl;
+    server_name api.kingdomimpactventures.org;
+
+    ssl_certificate /etc/letsencrypt/live/kingdomimpactventures.org/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/kingdomimpactventures.org/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    location / {
+        # MediaMTX's HLS muxer (mediamtx.yml: hlsAddress :8888), published
+        # to 127.0.0.1:18888 only (see the WHIP block's comment above for why the port number differs from the public 8888). Plain GET requests for the master
+        # playlist/segments — a simple passthrough proxy.
+        proxy_pass http://127.0.0.1:18888;
+        proxy_set_header Host api.kingdomimpactventures.org;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+
+# ── Manual step outside this file's / nginx's control ──────────────────
+# Lightsail's own instance firewall (separate from host iptables/nginx)
+# must allow inbound TCP on 1935, 8889, and 8888 before any of this is
+# reachable from the internet, regardless of what nginx or Docker do.
+# Neither this session nor `docker compose up` can grant that — it's an
+# AWS Lightsail console/API change outside this session's access (same
+# "no cloud CLI credentials here" limitation noted earlier in this
+# rollout). Nigel needs to open those three ports in the Lightsail
+# networking tab before end-to-end testing (Phase 7) can succeed.
