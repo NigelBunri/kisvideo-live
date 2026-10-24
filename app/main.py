@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from app.config.settings import settings
 from app.deps import require_hook_secret, require_internal_auth
+from app.disk_guard import disk_guard
 from app.ingest_proxy import ingest_proxy_manager
 from app.mediamtx_client import kick_publisher
 from app.recording import reconciliation_sweep, recording_manager
@@ -40,6 +41,11 @@ def _start_background_workers() -> None:
     # the lifetime of this process, same as ingest_proxy_manager's own
     # per-stream supervisor threads.
     reconciliation_sweep.start()
+    # Independent host-disk capacity monitor/alerting loop - see
+    # app/disk_guard.py's own docstring for why this is separate from
+    # the reconciliation sweep (different concern: host filesystem
+    # headroom, not recording-session state).
+    disk_guard.start()
 
 
 def _scheme(port_is_tls: bool) -> str:
@@ -86,6 +92,15 @@ class CreateStreamResponse(BaseModel):
 
 @app.post("/streams", dependencies=[Depends(require_internal_auth)])
 def create_stream() -> CreateStreamResponse:
+    # Disk backpressure first, before even touching the ingest-proxy
+    # port pool: a broadcast that's allowed to start but then runs the
+    # host out of disk mid-stream is a worse failure mode (a corrupted
+    # or truncated recording, possibly alongside every other container
+    # on this box) than an honest, immediate 503 at request time - see
+    # app/disk_guard.py's own docstring for how this threshold was sized.
+    if disk_guard.is_critical():
+        logger.error("POST /streams -> refused, disk capacity critical")
+        raise HTTPException(status_code=503, detail="Insufficient disk capacity to start a new recording right now.")
     # The path name IS the stream key — MediaMTX needs no pre-registration
     # (mediamtx.yml's `all_others` wildcard), so allocating one here is
     # just picking an unguessable name, not calling out to MediaMTX at all.

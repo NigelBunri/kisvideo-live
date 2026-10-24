@@ -172,19 +172,26 @@ class TestFinalizeSegmentsEndToEnd:
         probe_json = json.dumps({"format": {"duration": "42"}, "streams": [{"codec_type": "video"}]}).encode()
 
         with patch("app.recording.subprocess.run", return_value=subprocess.CompletedProcess([], 0, stdout=probe_json, stderr=b"")), \
-             patch.object(manager, "_request_upload_url", return_value=("https://s3.example/put", "https://s3.example/get")) as mock_req, \
+             patch.object(manager, "_request_upload_url", return_value=("https://s3.example/put", "https://s3.example/get", "broadcast_videos/live_recordings/key.mp4")) as mock_req, \
              patch.object(manager, "_upload", return_value=True) as mock_upload, \
+             patch.object(manager, "_report_processing") as mock_processing, \
              patch.object(manager, "_report_success") as mock_success, \
              patch.object(manager, "_report_failure") as mock_failure:
             manager._finalize_segments("live/abc", [str(seg)])
 
+        mock_processing.assert_called_once_with("live/abc")
         mock_req.assert_called_once()
         mock_upload.assert_called_once()
-        mock_success.assert_called_once_with("live/abc", "https://s3.example/get", 42)
+        mock_success.assert_called_once_with(
+            "live/abc", "https://s3.example/get", 42, "broadcast_videos/live_recordings/key.mp4",
+        )
         mock_failure.assert_not_called()
         # The original segment file must be removed after a successful
         # finalize - nothing left for the quota backstop to find.
         assert not seg.exists()
+        # And the work dir (holding the now-uploaded concat result) must
+        # be cleaned up too - nothing pending left behind on success.
+        assert not any((tmp_path / "work").iterdir())
 
     def test_no_video_stream_reports_failure_not_success(self, manager, tmp_path, monkeypatch):
         monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
@@ -209,8 +216,9 @@ class TestFinalizeSegmentsEndToEnd:
         probe_json = json.dumps({"format": {"duration": "10"}, "streams": [{"codec_type": "video"}]}).encode()
 
         with patch("app.recording.subprocess.run", return_value=subprocess.CompletedProcess([], 0, stdout=probe_json, stderr=b"")), \
-             patch.object(manager, "_request_upload_url", return_value=("https://s3.example/put", "https://s3.example/get")), \
+             patch.object(manager, "_request_upload_url", return_value=("https://s3.example/put", "https://s3.example/get", "some/key.mp4")), \
              patch.object(manager, "_upload", return_value=False), \
+             patch.object(manager, "_report_processing"), \
              patch.object(manager, "_report_success") as mock_success, \
              patch.object(manager, "_report_failure") as mock_failure:
             manager._finalize_segments("live/abc", [str(seg)])
@@ -218,11 +226,18 @@ class TestFinalizeSegmentsEndToEnd:
         mock_success.assert_not_called()
         mock_failure.assert_called_once_with("live/abc", "s3_upload_failed")
         # work dir (holding the concat result) must survive a failed
-        # upload for diagnosis/manual retry - only the quota backstop,
-        # not this path, ever removes it.
+        # upload for retry_pending_uploads - this is real, not-yet-
+        # uploaded user content, never deleted by this path or by the
+        # quota backstop (see TestLocalQuotaEnforcement).
         work_root = tmp_path / "work"
         assert work_root.exists()
-        assert any(work_root.iterdir())
+        work_dirs = list(work_root.iterdir())
+        assert len(work_dirs) == 1
+        assert (work_dirs[0] / "recording.mp4").exists()
+        assert (work_dirs[0] / "meta.json").exists()
+        meta = json.loads((work_dirs[0] / "meta.json").read_text())
+        assert meta["stream_id"] == "live/abc"
+        assert meta["duration_seconds"] == 10
 
 
 class TestLocalQuotaEnforcement:
@@ -248,8 +263,126 @@ class TestLocalQuotaEnforcement:
         assert not old_dir.exists(), "oldest directory must be evicted first"
         assert new_dir.exists(), "newer directory must survive if removing only the oldest satisfies the budget"
 
+    def test_never_evicts_a_directory_holding_a_pending_upload(self, manager, tmp_path, monkeypatch):
+        """The single most important guarantee of this module: a
+        recording.mp4 that passed validation but hasn't been confirmed
+        uploaded must survive quota pressure no matter how old it is or
+        how far over budget the box is - only retry_pending_uploads
+        (after a CONFIRMED upload) is allowed to remove it."""
+        monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
+        monkeypatch.setattr(recording_module, "MAX_LOCAL_RECORDING_BYTES", 10)
+
+        work_root = tmp_path / "work"
+        work_root.mkdir()
+        pending_dir = work_root / "pending"
+        pending_dir.mkdir()
+        (pending_dir / "recording.mp4").write_bytes(b"0" * 1000)  # way over the 10-byte budget
+        (pending_dir / "meta.json").write_text(json.dumps({"stream_id": "live/x", "duration_seconds": 10, "created_at": 0}))
+        import os
+        os.utime(pending_dir / "recording.mp4", (time.time() - 10_000, time.time() - 10_000))
+
+        manager._enforce_local_quota()
+
+        assert pending_dir.exists(), "a validated, not-yet-uploaded recording must never be deleted by the quota backstop"
+        assert (pending_dir / "recording.mp4").exists()
+
+    def test_garbage_dirs_without_a_recording_are_still_evicted_under_pressure(self, manager, tmp_path, monkeypatch):
+        monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
+        monkeypatch.setattr(recording_module, "MAX_LOCAL_RECORDING_BYTES", 10)
+
+        work_root = tmp_path / "work"
+        work_root.mkdir()
+        garbage_dir = work_root / "garbage"
+        garbage_dir.mkdir()
+        (garbage_dir / "concat_list.txt").write_bytes(b"0" * 1000)
+        import os
+        os.utime(garbage_dir / "concat_list.txt", (time.time() - 10_000, time.time() - 10_000))
+
+        manager._enforce_local_quota()
+
+        assert not garbage_dir.exists(), "a dir with no recording.mp4 (failed concat/probe) has nothing worth retaining"
+
+
+class TestRetryPendingUploads:
+    def test_successful_retry_archives_and_removes_the_work_dir(self, manager, tmp_path, monkeypatch):
+        monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
+        work_root = tmp_path / "work"
+        pending_dir = work_root / "pending1"
+        pending_dir.mkdir(parents=True)
+        (pending_dir / "recording.mp4").write_bytes(b"video")
+        (pending_dir / "meta.json").write_text(json.dumps({"stream_id": "live/xyz", "duration_seconds": 30, "created_at": time.time()}))
+
+        with patch.object(manager, "_try_upload_and_report", return_value=True) as mock_try:
+            manager.retry_pending_uploads()
+
+        mock_try.assert_called_once()
+        called_stream_id = mock_try.call_args[0][0]
+        assert called_stream_id == "live/xyz"
+        assert not pending_dir.exists()
+
+    def test_failed_retry_retains_the_work_dir(self, manager, tmp_path, monkeypatch):
+        monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
+        work_root = tmp_path / "work"
+        pending_dir = work_root / "pending2"
+        pending_dir.mkdir(parents=True)
+        (pending_dir / "recording.mp4").write_bytes(b"video")
+        (pending_dir / "meta.json").write_text(json.dumps({"stream_id": "live/xyz", "duration_seconds": 30, "created_at": time.time()}))
+
+        with patch.object(manager, "_try_upload_and_report", return_value=False):
+            manager.retry_pending_uploads()
+
+        assert pending_dir.exists(), "a retry that fails again must still never delete the recording"
+        assert (pending_dir / "recording.mp4").exists()
+
+    def test_skips_directories_with_no_meta_or_recording(self, manager, tmp_path, monkeypatch):
+        monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
+        work_root = tmp_path / "work"
+        incomplete_dir = work_root / "incomplete"
+        incomplete_dir.mkdir(parents=True)
+        (incomplete_dir / "concat_list.txt").write_bytes(b"x")
+
+        with patch.object(manager, "_try_upload_and_report") as mock_try:
+            manager.retry_pending_uploads()
+
+        mock_try.assert_not_called()
+
+    def test_skips_a_stream_already_actively_tracked_in_memory(self, manager, tmp_path, monkeypatch):
+        monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
+        work_root = tmp_path / "work"
+        pending_dir = work_root / "pending3"
+        pending_dir.mkdir(parents=True)
+        (pending_dir / "recording.mp4").write_bytes(b"video")
+        (pending_dir / "meta.json").write_text(json.dumps({"stream_id": "live/active", "duration_seconds": 5, "created_at": time.time()}))
+        manager.segment_complete("live/active", "/recordings/live/active/seg.mp4")
+
+        with patch.object(manager, "_try_upload_and_report") as mock_try:
+            manager.retry_pending_uploads()
+
+        mock_try.assert_not_called()
+
+    def test_unreadable_meta_json_is_left_in_place_not_deleted(self, manager, tmp_path, monkeypatch):
+        monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
+        work_root = tmp_path / "work"
+        pending_dir = work_root / "pending4"
+        pending_dir.mkdir(parents=True)
+        (pending_dir / "recording.mp4").write_bytes(b"video")
+        (pending_dir / "meta.json").write_text("not valid json {{{")
+
+        with patch.object(manager, "_try_upload_and_report") as mock_try:
+            manager.retry_pending_uploads()  # must not raise
+
+        mock_try.assert_not_called()
+        assert pending_dir.exists()
+
 
 class TestReconciliationSweep:
+    def test_sweep_also_drives_retry_pending_uploads(self, manager, tmp_path, monkeypatch):
+        monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
+        sweep = ReconciliationSweep(manager)
+        with patch.object(manager, "retry_pending_uploads") as mock_retry:
+            sweep._sweep_once()
+        mock_retry.assert_called_once()
+
     def test_skips_streams_currently_tracked_in_memory(self, manager, tmp_path, monkeypatch):
         monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
         monkeypatch.setattr(recording_module, "RECONCILE_STALE_SECONDS", 0)

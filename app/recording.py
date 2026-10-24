@@ -25,12 +25,17 @@ Division of responsibility, deliberately minimal new surface area:
     recording_status=ready with no playable asset behind it would be a
     replay that LOOKS done but nothing can actually play.
 
-Sized for THIS box specifically: disk is confirmed tight (17GB free of
-77GB at build time - see docker-compose.prod.yml's own capacity
-comments). Segments are deleted the moment a successful upload is
-confirmed; a failed upload keeps its segments (for diagnosis / manual
-retry) but nothing else writes to the shared volume indefinitely - see
-MAX_LOCAL_RECORDING_BYTES below for the hard backstop.
+Sized for THIS box specifically: disk is confirmed tight (16GB free of
+77GB at last recheck - see app/disk_guard.py, which is the independent
+host-level backpressure/alerting layer this module's own
+MAX_LOCAL_RECORDING_BYTES backstop does not replace). Segments are
+deleted the moment a successful upload is confirmed; a failed upload
+keeps its concatenated result on disk FOREVER until either a retry
+succeeds or an operator intervenes - this process never deletes a
+recording that has not been confirmed uploaded (see
+retry_pending_uploads/meta.json below). MAX_LOCAL_RECORDING_BYTES only
+ever bounds genuinely worthless leftovers (concat/validation failures
+with no usable output), never a pending-upload recording.
 
 Crash recovery: this process's in-memory _segments dict (which segment
 belongs to which broadcast) does not survive a restart. If the api
@@ -44,7 +49,10 @@ them, and re-drives them through the exact same finalize pipeline. This
 is safe to run repeatedly and safe to run against a directory that was
 already successfully archived - Django's own archive-webhook dedup
 (ChannelLiveStreamArchiveView, keyed on metadata__archived_from_stream)
-makes a resubmitted duplicate a no-op, not a second replay.
+makes a resubmitted duplicate a no-op, not a second replay. The same
+sweep also drives retry_pending_uploads - recovery for a validated
+recording.mp4 (meta.json present) that survived concat/probe but never
+made it past the upload step, across restarts.
 """
 
 from __future__ import annotations
@@ -58,7 +66,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import httpx
 
@@ -74,14 +82,17 @@ RECORDINGS_ROOT = Path(os.environ.get("RECORDINGS_ROOT", "/recordings"))
 # finalize-after-unpublish window, not an infinite wait.
 FINALIZE_GRACE_SECONDS = 4.0
 UPLOAD_TIMEOUT_SECONDS = 300.0
-# Hard backstop against unbounded local disk growth if uploads are
-# failing repeatedly - confirmed 17GB free on this box at implementation
-# time, not a guess. This does NOT replace mediamtx.yml's own
-# recordDeleteAfter safety net; it's an independent second layer scoped
-# to recordings this process itself has already tried and failed to
-# upload (recordDeleteAfter catches everything else, including segments
-# from a crashed process that never got this far at all).
+# Hard backstop against unbounded local disk growth from GARBAGE only
+# (concat/validation failures with no usable output) - this does NOT
+# apply to a validated recording.mp4 waiting on a retry; see
+# _enforce_local_quota's own filter and retry_pending_uploads below.
 MAX_LOCAL_RECORDING_BYTES = 3 * 1024 * 1024 * 1024  # 3GB
+# A pending upload still unresolved after this long escalates its
+# recurring sweep log line from WARNING to CRITICAL - an actionable
+# signal that something (network egress, Django availability, S3
+# credentials) needs operator attention, not a silent, indefinitely
+# retried no-op.
+RETRY_CRITICAL_AFTER_SECONDS = 24 * 60 * 60  # 24h
 
 
 class RecordingManager:
@@ -90,6 +101,10 @@ class RecordingManager:
         # stream_id -> ordered list of segment file paths, as reported by
         # MediaMTX's runOnRecordSegmentComplete hook.
         self._segments: Dict[str, List[str]] = {}
+        # work-dir names currently being retried by retry_pending_uploads,
+        # so two overlapping sweep passes can't double-upload the same
+        # pending recording.
+        self._retrying: Set[str] = set()
 
     def segment_complete(self, stream_id: str, segment_path: str) -> None:
         with self._lock:
@@ -152,57 +167,156 @@ class RecordingManager:
             final_path = self._concat(stream_id, segments, work_dir)
             if final_path is None:
                 self._report_failure(stream_id, "concat_failed")
+                shutil.rmtree(work_dir, ignore_errors=True)  # no usable output - nothing to retain
                 return
 
             probe = self._probe(final_path)
             if probe is None:
                 self._report_failure(stream_id, "recording_failed_validation")
+                shutil.rmtree(work_dir, ignore_errors=True)  # not a playable asset - nothing to retain
                 return
             duration_seconds, has_video, has_audio = probe
             if not has_video:
                 logger.error("recording: final file for stream=%s has no video stream", redact_stream_id(stream_id))
                 self._report_failure(stream_id, "no_video_stream")
+                shutil.rmtree(work_dir, ignore_errors=True)
                 return
 
-            upload = self._request_upload_url(stream_id)
-            if upload is None:
-                self._report_failure(stream_id, "upload_url_request_failed")
-                return
-            upload_url, object_url = upload
+            # From this point on, final_path is a validated, playable
+            # recording - meta.json is what makes it recoverable (by
+            # retry_pending_uploads, including across a process restart)
+            # instead of an anonymous file nothing can map back to a
+            # stream_id. This directory must never be deleted again
+            # below until a successful upload is confirmed.
+            self._write_meta(work_dir, stream_id, duration_seconds)
+            self._report_processing(stream_id)
 
-            if not self._upload(final_path, upload_url):
-                self._report_failure(stream_id, "s3_upload_failed")
-                return
-
-            self._report_success(stream_id, object_url, duration_seconds)
-            logger.info(
-                "recording: archived stream=%s duration=%ss", redact_stream_id(stream_id), duration_seconds,
-            )
-            # Uploaded and confirmed - nothing left worth keeping locally.
-            # Failure paths above return early WITHOUT reaching this line,
-            # deliberately leaving work_dir (and our concat output) on
-            # disk for diagnosis, bounded by _enforce_local_quota's 3GB
-            # backstop rather than deleted immediately.
-            shutil.rmtree(work_dir, ignore_errors=True)
+            if self._try_upload_and_report(stream_id, work_dir, final_path, duration_seconds):
+                shutil.rmtree(work_dir, ignore_errors=True)
+            else:
+                logger.error(
+                    "recording: upload failed for stream=%s - RETAINING recording at %s for retry "
+                    "(ReconciliationSweep.retry_pending_uploads), not deleting",
+                    redact_stream_id(stream_id), work_dir,
+                )
         except Exception:
             logger.exception("recording: unhandled error finalizing stream=%s", redact_stream_id(stream_id))
             self._report_failure(stream_id, "internal_error")
+            # Deliberately not touching work_dir here - if concat/probe
+            # already succeeded and meta.json was already written before
+            # this exception, retry_pending_uploads must still be able to
+            # find and recover it. If they hadn't, work_dir has no
+            # recording.mp4 and is harmless to leave for
+            # _enforce_local_quota to eventually reclaim.
         finally:
             # Only the ORIGINAL segments are safe to always delete here -
             # they're MediaMTX's own files, already superseded by either
             # the uploaded concat result or nothing (failure case, where
             # mediamtx.yml's recordDeleteAfter is the real backstop, not
             # this process holding onto raw segments it has no further
-            # use for). The work_dir (containing our own concat output)
-            # is removed in the success and give-up paths below, NOT
-            # unconditionally - see _report_failure's own cleanup
-            # decision for why a failed upload keeps it.
+            # use for).
             for seg in segments:
                 try:
                     os.remove(seg)
                 except OSError:
                     pass
             self._enforce_local_quota()
+
+    def _try_upload_and_report(self, stream_id: str, work_dir: Path, final_path: Path, duration_seconds: int) -> bool:
+        """Shared by the live finalize path and retry_pending_uploads -
+        one place that knows how to turn a validated recording.mp4 into
+        a confirmed, archived replay, so a retry is byte-for-byte the
+        same code path as the original attempt, not a second copy that
+        could drift."""
+        upload = self._request_upload_url(stream_id)
+        if upload is None:
+            self._report_failure(stream_id, "upload_url_request_failed")
+            return False
+        upload_url, object_url, object_key = upload
+
+        if not self._upload(final_path, upload_url):
+            self._report_failure(stream_id, "s3_upload_failed")
+            return False
+
+        self._report_success(stream_id, object_url, duration_seconds, object_key)
+        logger.info(
+            "recording: archived stream=%s duration=%ss", redact_stream_id(stream_id), duration_seconds,
+        )
+        return True
+
+    def _write_meta(self, work_dir: Path, stream_id: str, duration_seconds: int) -> None:
+        meta_path = work_dir / "meta.json"
+        try:
+            meta_path.write_text(json.dumps({
+                "stream_id": stream_id,
+                "duration_seconds": duration_seconds,
+                "created_at": time.time(),
+            }))
+        except OSError:
+            logger.exception("recording: failed writing meta.json for stream=%s", redact_stream_id(stream_id))
+
+    def retry_pending_uploads(self) -> None:
+        """Recovery for a validated recording.mp4 that survived
+        concat/probe but never made it past the upload step - whether
+        that's because of a transient failure in the same process run,
+        or because the process crashed/restarted after meta.json was
+        written but before the upload finished. Driven by
+        ReconciliationSweep on the same interval as its orphaned-segment
+        scan (see that class's own docstring for why a daemon-thread
+        poll, not Celery, is the right-sized mechanism here).
+
+        Never deletes anything it can't confirm was uploaded - a dir
+        that keeps failing just accumulates sweep passes (escalating to
+        a CRITICAL log line after RETRY_CRITICAL_AFTER_SECONDS) rather
+        than ever being silently discarded.
+        """
+        work_root = RECORDINGS_ROOT / "work"
+        if not work_root.exists():
+            return
+        for entry in sorted(work_root.iterdir()):
+            if not entry.is_dir():
+                continue
+            meta_path = entry / "meta.json"
+            final_path = entry / "recording.mp4"
+            if not meta_path.exists() or not final_path.exists():
+                continue  # not a retry-eligible dir - left to _enforce_local_quota instead
+
+            with self._lock:
+                if entry.name in self._retrying:
+                    continue
+                self._retrying.add(entry.name)
+            try:
+                try:
+                    meta = json.loads(meta_path.read_text())
+                except Exception:
+                    logger.exception("recording: unreadable meta.json at %s - leaving in place for manual review", entry)
+                    continue
+                stream_id = meta.get("stream_id")
+                if not stream_id:
+                    continue
+                if self.is_tracked(stream_id):
+                    continue  # a live finalize for this exact stream is already in flight elsewhere
+
+                duration_seconds = meta.get("duration_seconds") or 0
+                created_at = meta.get("created_at") or time.time()
+                age_seconds = time.time() - created_at
+                logger.info(
+                    "recording: retrying pending upload stream=%s age=%.0fs dir=%s",
+                    redact_stream_id(stream_id), age_seconds, entry.name,
+                )
+                if self._try_upload_and_report(stream_id, entry, final_path, duration_seconds):
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    log = logger.critical if age_seconds > RETRY_CRITICAL_AFTER_SECONDS else logger.warning
+                    log(
+                        "[RecordingRetained] unresolved pending upload stream=%s age=%.0fs dir=%s - "
+                        "recording preserved on disk, will retry again next sweep; investigate if this "
+                        "persists (network egress, Django availability, S3 credentials)",
+                        redact_stream_id(stream_id), age_seconds, entry.name,
+                    )
+            finally:
+                with self._lock:
+                    self._retrying.discard(entry.name)
 
     def _concat(self, stream_id: str, segments: List[str], work_dir: Path) -> Optional[Path]:
         out_path = work_dir / "recording.mp4"
@@ -280,7 +394,7 @@ class RecordingManager:
                 )
                 return None
             data = resp.json()
-            return data["upload_url"], data["object_url"]
+            return data["upload_url"], data["object_url"], data.get("object_key", "")
         except Exception:
             logger.exception("recording: upload-url request raised for stream=%s", redact_stream_id(stream_id))
             return None
@@ -303,14 +417,39 @@ class RecordingManager:
             logger.exception("recording: upload raised for %s", path)
             return False
 
-    def _report_success(self, stream_id: str, object_url: str, duration_seconds: int) -> None:
+    def _report_processing(self, stream_id: str) -> None:
+        """Reported once concat/validate actually succeeds and upload is
+        about to begin - a real sub-state distinct from "finalizing"
+        (publisher just disconnected; segments may not even be fully
+        collected yet). Best-effort, same as every other Django
+        notification in this module - a missed processing update just
+        means the UI shows "finalizing" a little longer, never a
+        correctness problem."""
         if not settings.django_api_base_url:
             return
         url = f"{settings.django_api_base_url}/broadcasts/live-streams/{stream_id}/archive/"
         try:
             httpx.post(
                 url,
-                json={"recording_url": object_url, "duration_seconds": duration_seconds},
+                json={"status": "processing"},
+                headers={"X-Live-Webhook-Secret": settings.django_webhook_secret},
+                timeout=15,
+            )
+        except Exception:
+            logger.exception("recording: processing-status report raised for stream=%s", redact_stream_id(stream_id))
+
+    def _report_success(self, stream_id: str, object_url: str, duration_seconds: int, object_key: str = "") -> None:
+        if not settings.django_api_base_url:
+            return
+        url = f"{settings.django_api_base_url}/broadcasts/live-streams/{stream_id}/archive/"
+        try:
+            httpx.post(
+                url,
+                json={
+                    "recording_url": object_url,
+                    "duration_seconds": duration_seconds,
+                    "object_key": object_key,
+                },
                 headers={"X-Live-Webhook-Secret": settings.django_webhook_secret},
                 timeout=15,
             )
@@ -335,14 +474,24 @@ class RecordingManager:
             work_root = RECORDINGS_ROOT / "work"
             if not work_root.exists():
                 return
-            entries = sorted(work_root.iterdir(), key=lambda p: p.stat().st_mtime)
-            total = sum(f.stat().st_size for e in entries for f in e.rglob("*") if f.is_file())
-            while total > MAX_LOCAL_RECORDING_BYTES and entries:
-                oldest = entries.pop(0)
+            # Only ever targets directories with NO valid recording.mp4 -
+            # genuine leftovers from a concat/probe failure or a crash
+            # mid-write. A directory holding a validated, not-yet-
+            # uploaded recording (meta.json + recording.mp4 present) is
+            # never a candidate here, no matter how old or how much
+            # total disk every such directory adds up to - that content
+            # is only ever removed after a confirmed upload, via
+            # _try_upload_and_report's own cleanup. See
+            # retry_pending_uploads for how those are resolved instead.
+            candidates = [e for e in work_root.iterdir() if e.is_dir() and not (e / "recording.mp4").exists()]
+            candidates.sort(key=lambda p: p.stat().st_mtime)
+            total = sum(f.stat().st_size for e in candidates for f in e.rglob("*") if f.is_file())
+            while total > MAX_LOCAL_RECORDING_BYTES and candidates:
+                oldest = candidates.pop(0)
                 size = sum(f.stat().st_size for f in oldest.rglob("*") if f.is_file())
                 shutil.rmtree(oldest, ignore_errors=True)
                 total -= size
-                logger.warning("recording: quota backstop removed stale work dir %s", oldest.name)
+                logger.warning("recording: quota backstop removed stale incomplete work dir %s", oldest.name)
         except Exception:
             logger.exception("recording: quota enforcement raised")
 
@@ -365,11 +514,14 @@ class ReconciliationSweep:
     segment landing on disk and that recording being archived) - see
     RecordingManager's own docstring for why the filesystem, not this
     process's memory, is the durable source of truth this sweep trusts.
+    Also drives RecordingManager.retry_pending_uploads - the equivalent
+    recovery path for a recording that got PAST concat/probe but never
+    got PAST upload.
 
     Deliberately NOT using Celery/an external job queue - this service
     has none today (confirmed: no celery/redis dependency in
-    requirements.txt), and introducing one for a single periodic sweep
-    on a single-instance service would be exactly the kind of
+    requirements.txt), and introducing one for a couple of periodic
+    sweeps on a single-instance service would be exactly the kind of
     unnecessary new infrastructure the task asked NOT to add. A daemon
     thread polling on a fixed interval is the right-sized mechanism for
     this service's actual scale (one process, one box).
@@ -390,6 +542,8 @@ class ReconciliationSweep:
                 logger.exception("recording: reconciliation sweep raised")
 
     def _sweep_once(self) -> None:
+        self._manager.retry_pending_uploads()
+
         live_root = RECORDINGS_ROOT / "live"
         if not live_root.exists():
             return
