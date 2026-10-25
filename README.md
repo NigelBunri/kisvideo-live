@@ -13,13 +13,20 @@ stack alongside Django/Nest/Postgres/Redis/`kisvideo`(VOD) — NOT a
 dedicated server. An earlier draft of this plan assumed a second machine;
 that was superseded (2026-09-22) in favor of keeping the MVP simple and
 cheap, after confirming the existing box has real (if not generous)
-headroom for a passthrough-only, low-concurrency v1 — see "Capacity
-assumptions" below.
+headroom — see [`docs/CAPACITY.md`](docs/CAPACITY.md) for the current,
+measured capacity model (this used to be a "Capacity assumptions"
+section in this file; it moved there once it grew past a README-sized
+note, and because it now documents real measured numbers rather than an
+MVP-stage assumption).
 
-**v1 scope is passthrough-only, single quality** — the incoming RTMP/WHIP
-stream is repackaged to HLS with no real-time re-encode/ABR ladder, and
-simulcast relay is stream-copy (no re-encode). No adaptive bitrate for
-viewers on poor connections in this version.
+**Live in production**: broadcaster RTMP/WHIP ingest, a real-time
+per-stream re-encode (`app/ingest_proxy.py`) to work around a MediaMTX
+HLS-muxer crash on some encoders' output, HLS/WHIP playback, automatic
+server-side recording (`app/recording.py`, native MediaMTX recording +
+concat/validate/upload to private S3), and simulcast relay to external
+platforms. Not passthrough-only or single-quality-only anymore — that
+described the original MVP scope before the recording/replay feature was
+built; see `docs/CAPACITY.md` for what's current.
 
 ## How it fits together
 
@@ -112,23 +119,17 @@ share a host now). Note the deliberately distinct alias
 here would make Docker's embedded DNS round-robin between two unrelated
 services. See `docker-compose.prod.yml`'s header comment.
 
-## Capacity assumptions (MVP, shared box)
+## Capacity, lifecycle, and operations
 
-Confirmed directly against kis-production (2026-09-22, not assumed): 2 CPU
-cores total, ~1.5GB "available" memory (`free -h`), 24GB disk free. This
-service's resource limits (`docker-compose.prod.yml`: mediamtx 0.5 CPU/
-256M, api 0.5 CPU/384M — the latter must cover ffmpeg relay subprocesses
-too, since they run inside the `api` container's own cgroup, not as
-separate containers) total well under that headroom, but only under a
-small-scale assumption: **a handful of concurrent live streams, a few
-simulcast targets each.** This holds because v1 is genuinely
-passthrough/stream-copy only (no ffmpeg re-encode anywhere in this
-service — confirmed, see `app/relay.py`'s docstring and `mediamtx.yml`'s
-`hlsVariant: mpegts` passthrough note), so cost scales with bandwidth and
-process count, not CPU-per-stream the way real-time transcoding would.
-This assumption should be revisited with real `docker stats` numbers
-during a live test (Phase 7/11 of the rollout plan) before assuming it
-holds at any meaningfully larger scale — it has not been load-tested.
+See [`docs/CAPACITY.md`](docs/CAPACITY.md) — the capacity model (every
+env-configurable limit and why it's set where it is), the full recording
+lifecycle and recovery/retry behavior, the synthetic load-test harness,
+the procedure for raising concurrency when the host gets more CPU/RAM,
+and the operational runbook. That document is now the source of truth
+for all of this; it superseded the "Capacity assumptions (MVP, shared
+box)" section that used to live here, which had grown stale (it still
+said "no ffmpeg re-encode anywhere in this service" and "not yet
+load-tested," both no longer true).
 
 **`HOOK_SHARED_SECRET`**: generate the same way, but this one has nothing
 to do with Django — it authenticates MediaMTX's own `runOnAvailable`/
@@ -152,11 +153,9 @@ main, 2026-09-22). `runOnAvailable`/`runOnUnavailable` fire when a
 publisher starts/stops sending on a path; `runOnRead`/`runOnUnread` fire
 per *viewer* connect/disconnect and would be the wrong signal here.
 
-**Not yet done**: never run end-to-end against a real MediaMTX instance or
-the mobile app's `LiveControlRoom.tsx` (both ingest paths - WHIP and
-RTMP), never load-tested the simulcast relay against a real external
-platform, `nginx-live-streaming.conf.snippet` has not been applied to the
-live nginx config, and the Lightsail firewall ports are not yet open. See
-the KIS live-streaming rollout plan's phased checklist for what's next —
-`LIVE_STREAM_PROVIDER` must stay `disabled`/`mux` in Django's production
-env until all of that passes.
+**Status**: live in production. `nginx-live-streaming.conf.snippet` is
+applied to the live nginx config, the Lightsail firewall ports are open,
+and this has been run end-to-end against the real mobile app and real
+test broadcasts repeatedly, including a full recording→archive→replay
+cycle. See `docs/CAPACITY.md` §11 for what remains a genuine, documented
+limitation rather than simply this file being out of date.

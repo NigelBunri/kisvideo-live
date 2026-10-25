@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 import pytest
 
-from app.disk_guard import DiskGuard, DISK_CRITICAL_FREE_BYTES, DISK_WARN_FREE_BYTES
+from app.config.capacity import capacity_settings
+from app.disk_guard import DiskGuard
 
 
 def _usage(total_gb: float, free_gb: float):
@@ -48,7 +49,7 @@ class TestLevel:
     def test_boundary_values_are_exclusive_critical(self, guard):
         # Exactly at the critical threshold is NOT yet critical - only
         # strictly below it is, matching check_and_log's own `<` test.
-        exact = DISK_CRITICAL_FREE_BYTES
+        exact = capacity_settings.disk_critical_free_bytes
         total = int(77e9)
         with patch("app.disk_guard.shutil.disk_usage", return_value=shutil._ntuple_diskusage(total, total - exact, exact)):
             assert guard.level() == "warn"

@@ -7,6 +7,12 @@ that would otherwise point at real paths/durations, no real ffmpeg/
 ffprobe/S3 calls (those are integration-level concerns, exercised
 instead by the real end-to-end test broadcast documented in the
 handover report).
+
+Capacity-related constants (MAX_LOCAL_RECORDING_BYTES, RECONCILE_STALE_SECONDS,
+etc.) moved to app/config/capacity.py's CapacitySettings - tests patch
+individual fields on the shared `capacity_settings` singleton directly
+(it's a plain mutable dataclass, not frozen, specifically so this works)
+rather than on the recording module itself.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app import recording as recording_module
+from app.config.capacity import capacity_settings
 from app.recording import RecordingManager, ReconciliationSweep
 
 
@@ -53,6 +60,14 @@ class TestSegmentBookkeeping:
         assert manager.is_tracked("live/abc") is True
         manager._take_segments("live/abc")
         assert manager.is_tracked("live/abc") is False
+
+    def test_active_count_reflects_tracked_streams(self, manager):
+        assert manager.active_count() == 0
+        manager.segment_complete("live/a", "/recordings/live/a/seg1.mp4")
+        manager.segment_complete("live/b", "/recordings/live/b/seg1.mp4")
+        assert manager.active_count() == 2
+        manager._take_segments("live/a")
+        assert manager.active_count() == 1
 
 
 class TestConcat:
@@ -243,7 +258,7 @@ class TestFinalizeSegmentsEndToEnd:
 class TestLocalQuotaEnforcement:
     def test_evicts_oldest_work_dirs_first_once_over_budget(self, manager, tmp_path, monkeypatch):
         monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
-        monkeypatch.setattr(recording_module, "MAX_LOCAL_RECORDING_BYTES", 10)
+        monkeypatch.setattr(capacity_settings, "max_local_recording_bytes", 10)
 
         work_root = tmp_path / "work"
         work_root.mkdir()
@@ -270,7 +285,7 @@ class TestLocalQuotaEnforcement:
         how far over budget the box is - only retry_pending_uploads
         (after a CONFIRMED upload) is allowed to remove it."""
         monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
-        monkeypatch.setattr(recording_module, "MAX_LOCAL_RECORDING_BYTES", 10)
+        monkeypatch.setattr(capacity_settings, "max_local_recording_bytes", 10)
 
         work_root = tmp_path / "work"
         work_root.mkdir()
@@ -288,7 +303,7 @@ class TestLocalQuotaEnforcement:
 
     def test_garbage_dirs_without_a_recording_are_still_evicted_under_pressure(self, manager, tmp_path, monkeypatch):
         monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
-        monkeypatch.setattr(recording_module, "MAX_LOCAL_RECORDING_BYTES", 10)
+        monkeypatch.setattr(capacity_settings, "max_local_recording_bytes", 10)
 
         work_root = tmp_path / "work"
         work_root.mkdir()
@@ -385,7 +400,7 @@ class TestReconciliationSweep:
 
     def test_skips_streams_currently_tracked_in_memory(self, manager, tmp_path, monkeypatch):
         monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
-        monkeypatch.setattr(recording_module, "RECONCILE_STALE_SECONDS", 0)
+        monkeypatch.setattr(capacity_settings, "reconcile_stale_seconds", 0)
         live_root = tmp_path / "live" / "activekey"
         live_root.mkdir(parents=True)
         (live_root / "seg.mp4").write_bytes(b"x")
@@ -399,7 +414,7 @@ class TestReconciliationSweep:
 
     def test_ignores_recently_written_directories(self, manager, tmp_path, monkeypatch):
         monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
-        monkeypatch.setattr(recording_module, "RECONCILE_STALE_SECONDS", 600)
+        monkeypatch.setattr(capacity_settings, "reconcile_stale_seconds", 600)
         live_root = tmp_path / "live" / "freshkey"
         live_root.mkdir(parents=True)
         (live_root / "seg.mp4").write_bytes(b"x")  # mtime = now
@@ -412,7 +427,7 @@ class TestReconciliationSweep:
 
     def test_recovers_an_orphaned_session_past_the_staleness_threshold(self, manager, tmp_path, monkeypatch):
         monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
-        monkeypatch.setattr(recording_module, "RECONCILE_STALE_SECONDS", 1)
+        monkeypatch.setattr(capacity_settings, "reconcile_stale_seconds", 1)
         live_root = tmp_path / "live" / "orphankey"
         live_root.mkdir(parents=True)
         seg = live_root / "seg.mp4"
@@ -432,7 +447,7 @@ class TestReconciliationSweep:
 
     def test_skips_empty_directories(self, manager, tmp_path, monkeypatch):
         monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)
-        monkeypatch.setattr(recording_module, "RECONCILE_STALE_SECONDS", 0)
+        monkeypatch.setattr(capacity_settings, "reconcile_stale_seconds", 0)
         (tmp_path / "live" / "emptykey").mkdir(parents=True)
 
         sweep = ReconciliationSweep(manager)

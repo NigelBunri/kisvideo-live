@@ -8,6 +8,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
+from app.config.capacity import CapacityConfigError, capacity_settings
 from app.config.settings import settings
 from app.deps import require_hook_secret, require_internal_auth
 from app.disk_guard import disk_guard
@@ -34,6 +35,24 @@ app = FastAPI(title="KIS Video Live Service")
 
 
 @app.on_event("startup")
+def _validate_capacity_config() -> None:
+    # Fail fast and loud: an invalid/contradictory capacity configuration
+    # (e.g. DISK_WARN_FREE_BYTES <= DISK_CRITICAL_FREE_BYTES, an empty
+    # INGEST_PROXY_PORTS) must stop this process from ever serving
+    # traffic, not surface later as confusing runtime behavior (every
+    # broadcast mysteriously 503ing, or the disk guard never alerting).
+    # Raising here propagates out of FastAPI's startup sequence and
+    # prevents uvicorn from binding - confirmed this is how FastAPI
+    # startup-event failures behave (the ASGI lifespan protocol's own
+    # startup-failure contract, not an assumption).
+    try:
+        capacity_settings.validate()
+    except CapacityConfigError:
+        logger.critical("FATAL: invalid capacity configuration - refusing to start", exc_info=True)
+        raise
+
+
+@app.on_event("startup")
 def _start_background_workers() -> None:
     # Recovery for recording sessions left in an intermediate state by a
     # PREVIOUS process instance (crash/restart) - see
@@ -46,6 +65,26 @@ def _start_background_workers() -> None:
     # the reconciliation sweep (different concern: host filesystem
     # headroom, not recording-session state).
     disk_guard.start()
+
+
+@app.on_event("shutdown")
+def _drain_active_broadcasts() -> None:
+    # A container restart/redeploy (docker compose up --force-recreate,
+    # or a plain `docker stop`) sends SIGTERM to this process. Uvicorn's
+    # own ASGI lifespan shutdown runs this handler before the process
+    # exits - releasing every still-held ingest-proxy reservation here
+    # makes the shutdown-time logs honest about what's being torn down.
+    # This does NOT attempt to let an active broadcast finish gracefully
+    # (there is no safe way to "pause" a live RTMP/WHIP publish
+    # mid-stream) - it bounds how long shutdown waits via
+    # shutdown_drain_timeout_seconds so this process never outlasts the
+    # orchestrator's own SIGTERM->SIGKILL grace period, then tears down
+    # cleanly. See app/ingest_proxy.py::IngestProxyManager.shutdown's own
+    # docstring for why no cross-restart state recovery is needed - a
+    # fresh process starts with an empty, correct reservation table
+    # regardless.
+    logger.info("shutdown: draining active ingest-proxy reservations (timeout=%.1fs)", capacity_settings.shutdown_drain_timeout_seconds)
+    ingest_proxy_manager.shutdown(capacity_settings.shutdown_drain_timeout_seconds)
 
 
 def _scheme(port_is_tls: bool) -> str:
@@ -78,7 +117,53 @@ def _urls_for_path(path: str, ingest_port: int) -> dict:
 
 @app.get("/health")
 def health() -> dict:
+    # Liveness only - "is this process up at all," never "can it accept
+    # a new broadcast right now." A service can be perfectly alive while
+    # every ingest-proxy port is occupied or disk is critical - that is
+    # GET /capacity's question, not this one. Conflating the two would
+    # make a container orchestrator restart a perfectly healthy process
+    # just because it's at capacity, which would be actively harmful
+    # (killing whatever broadcast IS currently using that capacity).
     return {"status": "ok", "service": "kisvideo-live"}
+
+
+class CapacityStatusResponse(BaseModel):
+    max_concurrent_broadcasts: int
+    active_broadcasts: int
+    available_slots: int
+    active_recordings: int
+    disk_level: str
+    disk_free_gb: float
+    disk_used_pct: float
+    measured_cpu_fraction_per_broadcast: float
+    measured_memory_mb_per_broadcast: int
+    accepting_new_broadcasts: bool
+
+
+@app.get("/capacity", dependencies=[Depends(require_internal_auth)])
+def capacity_status() -> CapacityStatusResponse:
+    """Readiness-for-new-work, distinct from GET /health's liveness
+    check (see that endpoint's own docstring). An operator (or Django,
+    before even trying POST /streams) can call this to see exactly why
+    admission would fail right now - insufficient port capacity vs. disk
+    pressure vs. neither - without SSHing in to read container logs.
+    Internal-auth-gated, same trust boundary as POST/DELETE /streams,
+    since active_broadcasts/disk figures are operational detail, not
+    public information."""
+    total, used, free = disk_guard.usage()
+    active = ingest_proxy_manager.active_count()
+    return CapacityStatusResponse(
+        max_concurrent_broadcasts=capacity_settings.max_concurrent_broadcasts,
+        active_broadcasts=active,
+        available_slots=max(capacity_settings.max_concurrent_broadcasts - active, 0),
+        active_recordings=recording_manager.active_count(),
+        disk_level=disk_guard.level(),
+        disk_free_gb=round(free / 1e9, 2),
+        disk_used_pct=round((used / total * 100) if total else 0.0, 1),
+        measured_cpu_fraction_per_broadcast=capacity_settings.measured_cpu_fraction_per_broadcast,
+        measured_memory_mb_per_broadcast=capacity_settings.measured_memory_mb_per_broadcast,
+        accepting_new_broadcasts=(not disk_guard.is_critical()) and active < capacity_settings.max_concurrent_broadcasts,
+    )
 
 
 class CreateStreamResponse(BaseModel):
@@ -98,6 +183,10 @@ def create_stream() -> CreateStreamResponse:
     # or truncated recording, possibly alongside every other container
     # on this box) than an honest, immediate 503 at request time - see
     # app/disk_guard.py's own docstring for how this threshold was sized.
+    # Checked and rejected BEFORE port allocation specifically so a
+    # disk-pressure rejection and a capacity-exhaustion rejection are
+    # distinguishable by which check ran, not just both collapsed into
+    # the same generic 503 (see the two distinct detail strings below).
     if disk_guard.is_critical():
         logger.error("POST /streams -> refused, disk capacity critical")
         raise HTTPException(status_code=503, detail="Insufficient disk capacity to start a new recording right now.")
@@ -202,18 +291,37 @@ def hook_ready(path: str = Query(...)) -> dict:
     encoder itself now connects to the ingest proxy's port, never to
     MediaMTX directly, so there is exactly one path per stream here
     again (no "/clean" sibling path to guard against, unlike the earlier,
-    abandoned post-MediaMTX relay attempt)."""
+    abandoned post-MediaMTX relay attempt).
+
+    Also cancels any pending disconnect-grace auto-release for this
+    exact path (see app/ingest_proxy.py's schedule_release) - this fires
+    on EVERY publisher connect, including the very first one for a
+    brand-new stream (which never had a release scheduled, so the cancel
+    is a harmless no-op) and a genuine reconnect after a brief drop
+    (where it matters)."""
     logger.info("MediaMTX hook: /hooks/ready path=%s (publisher connected)", redact_stream_id(path))
+    ingest_proxy_manager.cancel_scheduled_release(path)
     _notify_django(path, "live", recording_status="recording")
     return {"ok": True}
 
 
 @app.post("/hooks/not-ready", dependencies=[Depends(require_hook_secret)])
 def hook_not_ready(path: str = Query(...)) -> dict:
-    """Mirrors hook_ready for runOnUnavailable (publisher stopped)."""
+    """Mirrors hook_ready for runOnUnavailable (publisher stopped).
+
+    Schedules a bounded auto-release of this stream's ingest-proxy port
+    (see app/ingest_proxy.py's schedule_release docstring for the
+    permanent-capacity-leak bug this closes) rather than relying on
+    Django ever calling DELETE /streams for an organic disconnect, which
+    it does not do today - ChannelLiveStreamWebhookView (the Django-side
+    handler for the "ended" status this hook triggers via _notify_django
+    below) only updates ChannelLiveStream.status/ended_at; the explicit
+    provider.delete_live_stream() call only happens from the creator's
+    own End/Cancel actions."""
     logger.info("MediaMTX hook: /hooks/not-ready path=%s (publisher disconnected)", redact_stream_id(path))
     _notify_django(path, "ended", recording_status="finalizing")
     relay_manager.stop_all(path)
+    ingest_proxy_manager.schedule_release(path)
     # Concat/validate/upload/archive runs in a background thread - this
     # hook response must return promptly (MediaMTX is waiting on it
     # synchronously), and the whole point of recording_status=finalizing

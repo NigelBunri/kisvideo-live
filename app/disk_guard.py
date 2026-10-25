@@ -19,15 +19,21 @@ recording; it only:
      this process's upload-then-delete pipeline are what bound their
      footprint.
 
+Thresholds (DISK_WARN_FREE_BYTES/DISK_CRITICAL_FREE_BYTES) now live in
+app/config/capacity.py's CapacitySettings, overridable via
+DISK_WARN_FREE_BYTES/DISK_CRITICAL_FREE_BYTES env vars - see that
+module's own docstring for why every capacity-related limit in this
+service is centralized there rather than as a bare module constant here.
+
 Threshold sizing: a single concurrent recording is the architectural
-ceiling today (INGEST_PROXY_PORTS pool size - see app/ingest_proxy.py),
-and mediamtx.yml caps a single segment at recordSegmentDuration (2h).
+ceiling today (one ingest-proxy port - see app/ingest_proxy.py), and
+mediamtx.yml caps a single segment at recordSegmentDuration (2h).
 A realistic creator-stream encode (this ingest proxy's own fixed
 ultrafast x264 + 128k AAC settings - see app/ingest_proxy.py's _spawn)
-runs well under 1GB/hour. CRITICAL (5GB free) leaves comfortable room
-for a 2h worst-case segment plus the already-running concat/upload
-working set; WARN (10GB free) is the early-warning tier an operator can
-still act on before it's urgent.
+runs well under 1GB/hour. CRITICAL (5GB free, default) leaves
+comfortable room for a 2h worst-case segment plus the already-running
+concat/upload working set; WARN (10GB free, default) is the early-
+warning tier an operator can still act on before it's urgent.
 """
 
 from __future__ import annotations
@@ -38,11 +44,9 @@ import threading
 import time
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from app.config.capacity import capacity_settings
 
-DISK_WARN_FREE_BYTES = 10 * 1024 * 1024 * 1024  # 10GB
-DISK_CRITICAL_FREE_BYTES = 5 * 1024 * 1024 * 1024  # 5GB
-MONITOR_INTERVAL_SECONDS = 60
+logger = logging.getLogger(__name__)
 
 
 class DiskGuard:
@@ -55,9 +59,9 @@ class DiskGuard:
 
     def level(self) -> str:
         free = self.usage().free
-        if free < DISK_CRITICAL_FREE_BYTES:
+        if free < capacity_settings.disk_critical_free_bytes:
             return "critical"
-        if free < DISK_WARN_FREE_BYTES:
+        if free < capacity_settings.disk_warn_free_bytes:
             return "warn"
         return "ok"
 
@@ -95,7 +99,7 @@ class DiskGuard:
                 self.check_and_log()
             except Exception:
                 logger.exception("[DiskCapacity] monitor raised")
-            time.sleep(MONITOR_INTERVAL_SECONDS)
+            time.sleep(capacity_settings.disk_monitor_interval_seconds)
 
 
 def _recordings_root() -> Path:

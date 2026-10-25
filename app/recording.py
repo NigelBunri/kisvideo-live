@@ -25,17 +25,25 @@ Division of responsibility, deliberately minimal new surface area:
     recording_status=ready with no playable asset behind it would be a
     replay that LOOKS done but nothing can actually play.
 
+Timing/size constants below (grace periods, timeouts, quota, retry
+escalation) now come from app/config/capacity.py's CapacitySettings,
+overridable via env vars - see that module's own docstring for why
+every capacity-related limit in this service lives in one validated
+place instead of scattered module constants. RECORDINGS_ROOT stays here
+as a plain module constant - it's a storage mount path, not a numeric
+capacity knob.
+
 Sized for THIS box specifically: disk is confirmed tight (16GB free of
 77GB at last recheck - see app/disk_guard.py, which is the independent
 host-level backpressure/alerting layer this module's own
-MAX_LOCAL_RECORDING_BYTES backstop does not replace). Segments are
+max_local_recording_bytes backstop does not replace). Segments are
 deleted the moment a successful upload is confirmed; a failed upload
 keeps its concatenated result on disk FOREVER until either a retry
 succeeds or an operator intervenes - this process never deletes a
 recording that has not been confirmed uploaded (see
-retry_pending_uploads/meta.json below). MAX_LOCAL_RECORDING_BYTES only
-ever bounds genuinely worthless leftovers (concat/validation failures
-with no usable output), never a pending-upload recording.
+retry_pending_uploads/meta.json below). The quota backstop only ever
+bounds genuinely worthless leftovers (concat/validation failures with no
+usable output), never a pending-upload recording.
 
 Crash recovery: this process's in-memory _segments dict (which segment
 belongs to which broadcast) does not survive a restart. If the api
@@ -70,29 +78,13 @@ from typing import Dict, List, Optional, Set
 
 import httpx
 
+from app.config.capacity import capacity_settings
 from app.config.settings import settings
 from app.redact import redact_stream_id
 
 logger = logging.getLogger(__name__)
 
 RECORDINGS_ROOT = Path(os.environ.get("RECORDINGS_ROOT", "/recordings"))
-# A broadcast that never produces a usable recording (OBS connects and
-# disconnects in under a second, a genuinely empty segment) shouldn't
-# retry forever - these numbers are generous enough for a real stream's
-# finalize-after-unpublish window, not an infinite wait.
-FINALIZE_GRACE_SECONDS = 4.0
-UPLOAD_TIMEOUT_SECONDS = 300.0
-# Hard backstop against unbounded local disk growth from GARBAGE only
-# (concat/validation failures with no usable output) - this does NOT
-# apply to a validated recording.mp4 waiting on a retry; see
-# _enforce_local_quota's own filter and retry_pending_uploads below.
-MAX_LOCAL_RECORDING_BYTES = 3 * 1024 * 1024 * 1024  # 3GB
-# A pending upload still unresolved after this long escalates its
-# recurring sweep log line from WARNING to CRITICAL - an actionable
-# signal that something (network egress, Django availability, S3
-# credentials) needs operator attention, not a silent, indefinitely
-# retried no-op.
-RETRY_CRITICAL_AFTER_SECONDS = 24 * 60 * 60  # 24h
 
 
 class RecordingManager:
@@ -130,6 +122,15 @@ class RecordingManager:
         with self._lock:
             return stream_id in self._segments
 
+    def active_count(self) -> int:
+        """Number of streams this process currently has segments tracked
+        for - used by the capacity status endpoint to report "actively
+        recording" distinct from "port reserved" (a port can be reserved
+        during its disconnect grace window with zero active recording
+        left to track)."""
+        with self._lock:
+            return len(self._segments)
+
     def _finalize(self, stream_id: str) -> None:
         # MediaMTX closes the final (partial) segment on unpublish and
         # fires runOnRecordSegmentComplete for it too, but that event can
@@ -138,7 +139,7 @@ class RecordingManager:
         # two independent hook commands, not observed non-determinism we
         # chose to ignore. This grace window is cheap insurance against
         # archiving a recording that's missing its last few seconds.
-        time.sleep(FINALIZE_GRACE_SECONDS)
+        time.sleep(capacity_settings.finalize_grace_seconds)
         segments = self._take_segments(stream_id)
 
         if not segments:
@@ -267,8 +268,8 @@ class RecordingManager:
 
         Never deletes anything it can't confirm was uploaded - a dir
         that keeps failing just accumulates sweep passes (escalating to
-        a CRITICAL log line after RETRY_CRITICAL_AFTER_SECONDS) rather
-        than ever being silently discarded.
+        a CRITICAL log line after capacity_settings.retry_critical_after_seconds)
+        rather than ever being silently discarded.
         """
         work_root = RECORDINGS_ROOT / "work"
         if not work_root.exists():
@@ -307,7 +308,7 @@ class RecordingManager:
                 if self._try_upload_and_report(stream_id, entry, final_path, duration_seconds):
                     shutil.rmtree(entry, ignore_errors=True)
                 else:
-                    log = logger.critical if age_seconds > RETRY_CRITICAL_AFTER_SECONDS else logger.warning
+                    log = logger.critical if age_seconds > capacity_settings.retry_critical_after_seconds else logger.warning
                     log(
                         "[RecordingRetained] unresolved pending upload stream=%s age=%.0fs dir=%s - "
                         "recording preserved on disk, will retry again next sweep; investigate if this "
@@ -407,7 +408,7 @@ class RecordingManager:
                     upload_url,
                     content=f,
                     headers={"Content-Type": "video/mp4", "Content-Length": str(size)},
-                    timeout=UPLOAD_TIMEOUT_SECONDS,
+                    timeout=capacity_settings.upload_timeout_seconds,
                 )
             if resp.status_code not in (200, 201):
                 logger.error("recording: S3 PUT failed status=%s body=%s", resp.status_code, resp.text[:300])
@@ -486,7 +487,7 @@ class RecordingManager:
             candidates = [e for e in work_root.iterdir() if e.is_dir() and not (e / "recording.mp4").exists()]
             candidates.sort(key=lambda p: p.stat().st_mtime)
             total = sum(f.stat().st_size for e in candidates for f in e.rglob("*") if f.is_file())
-            while total > MAX_LOCAL_RECORDING_BYTES and candidates:
+            while total > capacity_settings.max_local_recording_bytes and candidates:
                 oldest = candidates.pop(0)
                 size = sum(f.stat().st_size for f in oldest.rglob("*") if f.is_file())
                 shutil.rmtree(oldest, ignore_errors=True)
@@ -497,15 +498,6 @@ class RecordingManager:
 
 
 recording_manager = RecordingManager()
-
-# How long a recording directory's newest file must sit untouched before
-# the sweep treats it as abandoned (crashed process, missed hook) rather
-# than an actively-publishing stream between segments. Comfortably above
-# recordSegmentDuration's 2h AND any realistic hook-delivery delay -
-# this is specifically for "the process that was supposed to finalize
-# this never did," not a tight liveness check.
-RECONCILE_STALE_SECONDS = 15 * 60
-RECONCILE_INTERVAL_SECONDS = 5 * 60
 
 
 class ReconciliationSweep:
@@ -535,7 +527,7 @@ class ReconciliationSweep:
 
     def _loop(self) -> None:
         while True:
-            time.sleep(RECONCILE_INTERVAL_SECONDS)
+            time.sleep(capacity_settings.reconcile_interval_seconds)
             try:
                 self._sweep_once()
             except Exception:
@@ -568,7 +560,7 @@ class ReconciliationSweep:
                 continue
 
             newest_age = now - files[-1].stat().st_mtime
-            if newest_age < RECONCILE_STALE_SECONDS:
+            if newest_age < capacity_settings.reconcile_stale_seconds:
                 continue  # could still be an active publish between segments
 
             logger.warning(
