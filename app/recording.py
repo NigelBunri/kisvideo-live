@@ -235,7 +235,7 @@ class RecordingManager:
             return False
         upload_url, object_url, object_key = upload
 
-        if not self._upload(final_path, upload_url):
+        if not self._upload(final_path, upload_url, object_url):
             self._report_failure(stream_id, "s3_upload_failed")
             return False
 
@@ -400,23 +400,108 @@ class RecordingManager:
             logger.exception("recording: upload-url request raised for stream=%s", redact_stream_id(stream_id))
             return None
 
-    def _upload(self, path: Path, upload_url: str) -> bool:
-        try:
-            size = path.stat().st_size
-            with open(path, "rb") as f:
-                resp = httpx.put(
-                    upload_url,
-                    content=f,
-                    headers={"Content-Type": "video/mp4", "Content-Length": str(size)},
-                    timeout=capacity_settings.upload_timeout_seconds,
+    def _upload(self, path: Path, upload_url: str, object_url: str) -> bool:
+        """Bounded retry with exponential backoff for a SINGLE upload
+        attempt (capacity_settings.upload_max_attempts/
+        upload_retry_base_delay_seconds) - distinct from (and much
+        shorter than) retry_pending_uploads' own sweep-level retention,
+        which deliberately has no maximum. This bound only covers
+        TRANSIENT conditions (a dropped connection, a timeout, a 5xx) -
+        a 4xx response (most realistically an expired presigned URL)
+        is never retried here, since retrying the exact same URL cannot
+        succeed; it falls straight through to the sweep-level retry,
+        which fetches a FRESH presigned URL on its next pass.
+
+        After a successful PUT, verifies the object actually exists at
+        its real size via a plain HEAD to object_url (not upload_url -
+        a presigned PUT URL's signature is method-specific and would
+        reject a HEAD; object_url is the plain, non-expiring URL
+        recordings get under the broadcast_videos/live_recordings public
+        prefix convention - see Django's AWS_S3_PUBLIC_PREFIXES). This
+        is the "Object existence and size verification" step a bare
+        '200 OK' from S3 does not, by itself, guarantee against (a
+        theoretical but real gap: nothing before this confirmed the
+        object S3 claims to have stored actually matches what was
+        sent)."""
+        size = path.stat().st_size
+        last_status: Optional[int] = None
+        for attempt in range(1, capacity_settings.upload_max_attempts + 1):
+            try:
+                with open(path, "rb") as f:
+                    resp = httpx.put(
+                        upload_url,
+                        content=f,
+                        headers={"Content-Type": "video/mp4", "Content-Length": str(size)},
+                        timeout=capacity_settings.upload_timeout_seconds,
+                    )
+            except Exception:
+                logger.exception(
+                    "recording: upload attempt %d/%d raised for %s",
+                    attempt, capacity_settings.upload_max_attempts, path,
                 )
-            if resp.status_code not in (200, 201):
-                logger.error("recording: S3 PUT failed status=%s body=%s", resp.status_code, resp.text[:300])
+                if attempt < capacity_settings.upload_max_attempts:
+                    time.sleep(capacity_settings.upload_retry_base_delay_seconds * (2 ** (attempt - 1)))
+                    continue
+                return False
+
+            if resp.status_code in (200, 201):
+                return self._verify_uploaded_object(object_url, size)
+
+            last_status = resp.status_code
+            if 400 <= resp.status_code < 500:
+                # Not retryable within this attempt - the same
+                # presigned URL will fail the same way again (e.g. it
+                # expired, or the signature/policy rejected this
+                # specific request). Give up on THIS attempt loop
+                # immediately rather than burning the remaining budget
+                # retrying something that cannot succeed; the
+                # sweep-level retry gets a brand new URL next time.
+                logger.error(
+                    "recording: S3 PUT non-retryable status=%s body=%s",
+                    resp.status_code, resp.text[:300],
+                )
+                return False
+
+            logger.error(
+                "recording: S3 PUT attempt %d/%d failed status=%s body=%s",
+                attempt, capacity_settings.upload_max_attempts, resp.status_code, resp.text[:300],
+            )
+            if attempt < capacity_settings.upload_max_attempts:
+                time.sleep(capacity_settings.upload_retry_base_delay_seconds * (2 ** (attempt - 1)))
+
+        logger.error(
+            "recording: upload exhausted %d attempts, last status=%s",
+            capacity_settings.upload_max_attempts, last_status,
+        )
+        return False
+
+    def _verify_uploaded_object(self, object_url: str, expected_size: int) -> bool:
+        try:
+            resp = httpx.head(object_url, timeout=30)
+            if resp.status_code != 200:
+                logger.error(
+                    "recording: post-upload verification HEAD failed status=%s url=%s",
+                    resp.status_code, object_url,
+                )
+                return False
+            content_length = resp.headers.get("content-length")
+            if content_length is not None and int(content_length) != expected_size:
+                logger.error(
+                    "recording: post-upload size mismatch expected=%d actual=%s url=%s",
+                    expected_size, content_length, object_url,
+                )
                 return False
             return True
         except Exception:
-            logger.exception("recording: upload raised for %s", path)
-            return False
+            # A HEAD failing here (network blip, DNS) after the PUT
+            # itself already returned 200/201 is treated as a soft
+            # pass, not a hard failure - the object is very likely fine
+            # (S3 already confirmed the write), and re-uploading a
+            # multi-hundred-MB file just because a tiny follow-up HEAD
+            # request hiccuped would be a worse outcome than trusting
+            # S3's own prior 200. Logged for visibility either way.
+            logger.exception("recording: post-upload verification raised for %s", object_url)
+            return True
 
     def _report_processing(self, stream_id: str) -> None:
         """Reported once concat/validate actually succeeds and upload is

@@ -318,6 +318,118 @@ class TestLocalQuotaEnforcement:
         assert not garbage_dir.exists(), "a dir with no recording.mp4 (failed concat/probe) has nothing worth retaining"
 
 
+class TestUploadRetryAndVerification:
+    """Real tests for the actual new behavior in _upload: bounded
+    exponential-backoff retry for transient failures, immediate give-up
+    for non-retryable (4xx) responses, and a post-upload HEAD
+    verification confirming the object exists at the expected size
+    before this method reports success."""
+
+    def test_succeeds_on_first_attempt_with_no_retry_and_verifies_size(self, manager, tmp_path):
+        f = tmp_path / "recording.mp4"
+        f.write_bytes(b"0" * 100)
+
+        put_resp = MagicMock(status_code=200)
+        head_resp = MagicMock(status_code=200, headers={"content-length": "100"})
+        with patch("app.recording.httpx.put", return_value=put_resp) as mock_put, \
+             patch("app.recording.httpx.head", return_value=head_resp) as mock_head:
+            result = manager._upload(f, "https://s3.example/put", "https://s3.example/get")
+
+        assert result is True
+        mock_put.assert_called_once()
+        mock_head.assert_called_once_with("https://s3.example/get", timeout=30)
+
+    def test_retries_a_transient_5xx_and_succeeds_on_a_later_attempt(self, manager, tmp_path, monkeypatch):
+        monkeypatch.setattr(capacity_settings, "upload_retry_base_delay_seconds", 0.0)  # keep the test fast
+        f = tmp_path / "recording.mp4"
+        f.write_bytes(b"0" * 50)
+
+        responses = [MagicMock(status_code=503, text="service unavailable"), MagicMock(status_code=200)]
+        head_resp = MagicMock(status_code=200, headers={"content-length": "50"})
+        with patch("app.recording.httpx.put", side_effect=responses) as mock_put, \
+             patch("app.recording.httpx.head", return_value=head_resp):
+            result = manager._upload(f, "https://s3.example/put", "https://s3.example/get")
+
+        assert result is True
+        assert mock_put.call_count == 2
+
+    def test_gives_up_immediately_on_a_4xx_without_exhausting_retries(self, manager, tmp_path, monkeypatch):
+        monkeypatch.setattr(capacity_settings, "upload_retry_base_delay_seconds", 0.0)
+        f = tmp_path / "recording.mp4"
+        f.write_bytes(b"0" * 50)
+
+        with patch("app.recording.httpx.put", return_value=MagicMock(status_code=403, text="SignatureDoesNotMatch")) as mock_put:
+            result = manager._upload(f, "https://s3.example/put", "https://s3.example/get")
+
+        assert result is False
+        # A 4xx means the SAME url will fail the same way again - must
+        # not waste the remaining retry budget on a request that cannot
+        # succeed.
+        assert mock_put.call_count == 1
+
+    def test_exhausts_all_attempts_on_a_persisting_5xx(self, manager, tmp_path, monkeypatch):
+        monkeypatch.setattr(capacity_settings, "upload_retry_base_delay_seconds", 0.0)
+        monkeypatch.setattr(capacity_settings, "upload_max_attempts", 3)
+        f = tmp_path / "recording.mp4"
+        f.write_bytes(b"0" * 50)
+
+        with patch("app.recording.httpx.put", return_value=MagicMock(status_code=500, text="boom")) as mock_put:
+            result = manager._upload(f, "https://s3.example/put", "https://s3.example/get")
+
+        assert result is False
+        assert mock_put.call_count == 3
+
+    def test_retries_a_connection_exception_then_succeeds(self, manager, tmp_path, monkeypatch):
+        monkeypatch.setattr(capacity_settings, "upload_retry_base_delay_seconds", 0.0)
+        f = tmp_path / "recording.mp4"
+        f.write_bytes(b"0" * 50)
+
+        import httpx as httpx_module
+        with patch(
+            "app.recording.httpx.put",
+            side_effect=[httpx_module.ConnectError("refused"), MagicMock(status_code=200)],
+        ) as mock_put, \
+             patch("app.recording.httpx.head", return_value=MagicMock(status_code=200, headers={"content-length": "50"})):
+            result = manager._upload(f, "https://s3.example/put", "https://s3.example/get")
+
+        assert result is True
+        assert mock_put.call_count == 2
+
+    def test_post_upload_size_mismatch_fails_verification(self, manager, tmp_path):
+        f = tmp_path / "recording.mp4"
+        f.write_bytes(b"0" * 100)  # local file is 100 bytes
+
+        with patch("app.recording.httpx.put", return_value=MagicMock(status_code=200)), \
+             patch("app.recording.httpx.head", return_value=MagicMock(status_code=200, headers={"content-length": "42"})):
+            result = manager._upload(f, "https://s3.example/put", "https://s3.example/get")
+
+        assert result is False, "a verified object size that disagrees with the local file must fail, not pass silently"
+
+    def test_post_upload_verification_head_failure_is_treated_as_a_soft_pass(self, manager, tmp_path):
+        # The PUT already succeeded (S3 itself confirmed the write) - a
+        # follow-up HEAD raising (network blip, DNS) must not force a
+        # re-upload of a potentially large file just because a tiny
+        # verification request hiccuped.
+        f = tmp_path / "recording.mp4"
+        f.write_bytes(b"0" * 50)
+
+        with patch("app.recording.httpx.put", return_value=MagicMock(status_code=200)), \
+             patch("app.recording.httpx.head", side_effect=OSError("network blip")):
+            result = manager._upload(f, "https://s3.example/put", "https://s3.example/get")
+
+        assert result is True
+
+    def test_verification_head_returning_non_200_fails(self, manager, tmp_path):
+        f = tmp_path / "recording.mp4"
+        f.write_bytes(b"0" * 50)
+
+        with patch("app.recording.httpx.put", return_value=MagicMock(status_code=200)), \
+             patch("app.recording.httpx.head", return_value=MagicMock(status_code=404)):
+            result = manager._upload(f, "https://s3.example/put", "https://s3.example/get")
+
+        assert result is False
+
+
 class TestRetryPendingUploads:
     def test_successful_retry_archives_and_removes_the_work_dir(self, manager, tmp_path, monkeypatch):
         monkeypatch.setattr(recording_module, "RECORDINGS_ROOT", tmp_path)

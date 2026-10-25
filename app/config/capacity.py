@@ -147,6 +147,22 @@ class CapacitySettings:
     upload_timeout_seconds: float = 300.0
     max_local_recording_bytes: int = 3 * 1024 * 1024 * 1024
     retry_critical_after_seconds: int = 24 * 60 * 60
+    # Bounded, in-attempt retry for a single upload - distinct from (and
+    # much shorter than) the outer sweep-level retention in
+    # retry_pending_uploads, which deliberately has NO maximum (a real
+    # recording is never given up on just because enough sweep passes
+    # failed - see that method's own docstring). This bound exists so a
+    # single transient blip (a dropped connection mid-PUT, a momentary
+    # 5xx) doesn't make a recording wait a full
+    # reconcile_interval_seconds (minutes) before even trying again, when
+    # a few seconds of backoff would have resolved it. Only applies to
+    # errors classified as retryable (connection errors, timeouts, 5xx) -
+    # see _upload's own classification; a 4xx (e.g. an expired presigned
+    # URL) is never retried within the same attempt, since retrying the
+    # exact same URL again cannot succeed - the sweep-level retry already
+    # fetches a FRESH presigned URL on its next pass.
+    upload_max_attempts: int = 3
+    upload_retry_base_delay_seconds: float = 1.0
 
     # ── Reconciliation sweep ────────────────────────────────────────────
     reconcile_interval_seconds: int = 5 * 60
@@ -184,6 +200,8 @@ class CapacitySettings:
             disk_monitor_interval_seconds=_env_int("DISK_MONITOR_INTERVAL_SECONDS", 60),
             finalize_grace_seconds=_env_float("FINALIZE_GRACE_SECONDS", 4.0),
             upload_timeout_seconds=_env_float("UPLOAD_TIMEOUT_SECONDS", 300.0),
+            upload_max_attempts=_env_int("UPLOAD_MAX_ATTEMPTS", 3),
+            upload_retry_base_delay_seconds=_env_float("UPLOAD_RETRY_BASE_DELAY_SECONDS", 1.0),
             max_local_recording_bytes=_env_int("MAX_LOCAL_RECORDING_BYTES", 3 * 1024 * 1024 * 1024),
             retry_critical_after_seconds=_env_int("RETRY_CRITICAL_AFTER_SECONDS", 24 * 60 * 60),
             reconcile_interval_seconds=_env_int("RECONCILE_INTERVAL_SECONDS", 5 * 60),
@@ -214,6 +232,10 @@ class CapacitySettings:
             raise CapacityConfigError("FINALIZE_GRACE_SECONDS cannot be negative")
         if self.upload_timeout_seconds <= 0:
             raise CapacityConfigError("UPLOAD_TIMEOUT_SECONDS must be positive")
+        if self.upload_max_attempts < 1:
+            raise CapacityConfigError("UPLOAD_MAX_ATTEMPTS must be at least 1")
+        if self.upload_retry_base_delay_seconds < 0:
+            raise CapacityConfigError("UPLOAD_RETRY_BASE_DELAY_SECONDS cannot be negative")
         if self.max_local_recording_bytes <= 0:
             raise CapacityConfigError("MAX_LOCAL_RECORDING_BYTES must be positive")
         if self.retry_critical_after_seconds <= 0:

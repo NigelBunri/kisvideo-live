@@ -67,6 +67,8 @@ silent misconfiguration.
 | Disk monitor interval | `DISK_MONITOR_INTERVAL_SECONDS` | `60` | How often the disk guard polls. |
 | Finalize grace | `FINALIZE_GRACE_SECONDS` | `4.0` | Wait after unpublish before collecting segments, covering hook-ordering race between `runOnUnavailable` and the final `runOnRecordSegmentComplete`. |
 | Upload timeout | `UPLOAD_TIMEOUT_SECONDS` | `300.0` | Per-attempt S3 PUT timeout. |
+| Upload max attempts | `UPLOAD_MAX_ATTEMPTS` | `3` | Bounded in-attempt retry for a transient failure (connection error, timeout, 5xx) - exponential backoff between attempts. A 4xx is never retried within this bound (the same presigned URL cannot succeed on retry). Distinct from, and much shorter than, the sweep-level retention in `retry_pending_uploads`, which has no maximum by design. |
+| Upload retry base delay | `UPLOAD_RETRY_BASE_DELAY_SECONDS` | `1.0` | Base for the exponential backoff between attempts (`base * 2^attempt`). |
 | Local quota backstop | `MAX_LOCAL_RECORDING_BYTES` | `3GB` | Only ever reclaims *garbage* (failed concat/probe, no `recording.mp4`) — never a validated, not-yet-uploaded recording. |
 | Retry escalation | `RETRY_CRITICAL_AFTER_SECONDS` | `24h` | A pending upload still unresolved after this long logs `CRITICAL`, not `WARNING`. |
 | Reconciliation interval | `RECONCILE_INTERVAL_SECONDS` | `300` | How often the sweep runs (orphan recovery + pending-upload retry). |
@@ -78,6 +80,18 @@ silent misconfiguration.
 **Changing the port pool changes the concurrency limit.** There is
 deliberately no second "max broadcasts" setting — see §6.1 for why that
 specific design choice matters.
+
+**Upload integrity**: a bare S3 `200 OK` on the PUT is not, by itself,
+proof the object actually exists at the size that was sent. After every
+successful PUT, `_upload` issues a plain `HEAD` against the recording's
+public `object_url` (recordings live under the
+`broadcast_videos/live_recordings` public-prefix convention — see
+Django's `AWS_S3_PUBLIC_PREFIXES`) and compares `Content-Length` against
+the local file size before reporting success to Django. A HEAD that
+itself fails (network blip) is treated as a soft pass, not a hard
+failure — the PUT already succeeded; re-uploading a large file because a
+tiny follow-up request hiccuped would be a worse outcome than trusting
+S3's own prior confirmation.
 
 ## 3. Measured resource cost per broadcast
 
