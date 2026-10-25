@@ -16,6 +16,22 @@
 api: true
 apiAddress: :9997
 
+# ─── I/O timeouts ───────────────────────────────────────────────────────────
+# MediaMTX's own built-in default is 10s for both of these, applied to every
+# protocol's connections (not RTMP-specific). That's far too short for a real
+# broadcaster: a real production incident (2026-10-25) showed OBS publishing
+# fine for ~12s and then the RTMP connection getting killed outright with
+# "i/o timeout" - any ordinary bitrate dip or wifi hiccup longer than 10s is
+# enough to kill the stream entirely, which is exactly what viewers saw as a
+# stream that starts, immediately dies, and never produces playable HLS
+# segments. This is the same category of bug this codebase already hit once
+# in app/ingest_proxy.py's disconnect handling - a short fixed timer standing
+# in for "did the broadcaster actually give up", when real network/human
+# timing variance routinely exceeds a few seconds. 60s gives real slack for
+# that variance without masking a genuinely dead connection for long.
+readTimeout: 60s
+writeTimeout: 60s
+
 # MediaMTX's own built-in default (verified against the real
 # bluenviron/mediamtx main mediamtx.yml, not assumed) restricts the `api`
 # action to ips: ["127.0.0.1", "::1"] — which is the CONTROL API'S OWN
