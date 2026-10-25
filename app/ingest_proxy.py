@@ -39,32 +39,53 @@ the full sizing procedure.
 
 Supervised, not one-shot: "-listen 1" exits once the one connection it
 accepted closes - a broadcaster's encoder reconnecting (confirmed to
-happen in practice: OBS's own auto-reconnect) would find a dead listener
-with nothing accepting on that port anymore. Each allocated port runs
-under a supervisor thread that immediately respawns a fresh listener
-after the previous one exits, for as long as the stream is still
-"desired" (i.e. hasn't been explicitly released via DELETE /streams OR
-auto-released after a disconnect grace period - see
-schedule_release/cancel_scheduled_release below).
+happen in practice: OBS's own auto-reconnect, and a human manually
+stopping then restarting OBS) would find a dead listener with nothing
+accepting on that port anymore. Each allocated port runs under a
+supervisor thread that immediately respawns a fresh listener after the
+previous one exits, for as long as the stream is still "desired" (i.e.
+hasn't been explicitly released via DELETE /streams, or found genuinely
+abandoned by release_stale_reservations - see below).
 
-Reservation release on disconnect — the bug this module previously had:
-MediaMTX's runOnUnavailable hook (app/main.py's hook_not_ready) fires the
-instant a publisher disconnects, but the ONLY thing that ever called
-release() was an explicit DELETE /streams/{id} - which Django's organic
-"stream ended" webhook path (ChannelLiveStreamWebhookView, triggered by
-that same hook_not_ready call, one hop away) never actually calls; only
-the creator's own explicit "End Stream"/"Cancel" actions in the app do
-(ChannelLiveStreamEndView/ChannelLiveStreamCancelView). A broadcaster
-whose OBS crashed, lost network, or who simply closed the encoder without
-tapping "End Stream" in the app left its port reserved to a dead stream
-forever - with a pool size of 1, exactly ONE such disconnect permanently
-exhausts this service's entire capacity until a human intervenes or the
-container restarts. schedule_release()/cancel_scheduled_release() below
-close that gap: a disconnect starts a bounded grace timer (long enough
-for the same OBS to reconnect to the same port, matching why the
-supervisor respawns in the first place); a reconnect (hook_ready for the
-same stream_id) cancels it; letting it expire releases the port
-automatically, no explicit DELETE required.
+Reservation release on disconnect — history of a real production
+incident, not a hypothetical: the ORIGINAL version of this module never
+released a port after an organic disconnect at all - only an explicit
+DELETE /streams/{id} did, which Django's "stream ended" webhook path
+never calls for that case (only the creator's own explicit End/Cancel
+actions in the app do). That left a port reserved forever if a creator
+ever abandoned OBS without tapping "End Stream," permanently exhausting
+a one-port pool.
+
+A FIRST fix attempt (schedule_release/cancel_scheduled_release, a short
+threading.Timer started on every disconnect) made this dramatically
+worse in practice, not better: it fired after a fixed, short grace
+window (originally 8 seconds) regardless of WHY the publisher
+disconnected, and when it fired, it didn't just free bookkeeping - it
+KILLED the currently-listening ffmpeg process outright. A real
+broadcaster who simply clicked "Stop Streaming" then took more than a
+few seconds deciding to restart (the overwhelmingly normal case for a
+human, not an edge case) found their encoder's reconnect attempt met
+with a dead listener and a flat "failed to connect to server," with no
+clear recovery path short of getting a brand-new stream key from the
+app. This was caught from a real user's real broadcast within minutes
+of deployment, confirmed via production logs
+(`scheduled auto-release... in 8.0s` -> `auto-releasing... no
+reconnect within 8.0s`), and reverted the same session it was found.
+
+The actual fix: NO per-disconnect timer, and NOTHING kills a listener on
+a tight fuse ever again. mark_disconnected()/mark_reconnected() below
+just record a plain timestamp - the listener keeps running, exactly
+like the pre-incident original behavior, for any reconnect that happens
+on any realistic human timescale (seconds to many minutes). The
+permanent-leak problem this was all trying to solve is instead handled
+by release_stale_reservations(), driven by the EXISTING reconciliation
+sweep (app/recording.py's ReconciliationSweep, already running every
+RECONCILE_INTERVAL_SECONDS) on the SAME already-proven
+RECONCILE_STALE_SECONDS threshold (15 minutes by default) that governs
+when a recording session is considered genuinely abandoned elsewhere in
+this codebase - reusing a value with a real track record, not
+introducing a second, shorter, independently-tuned one that turned out
+to be miscalibrated the first time.
 """
 
 from __future__ import annotations
@@ -72,7 +93,8 @@ from __future__ import annotations
 import logging
 import subprocess
 import threading
-from typing import Dict, Optional, Set
+import time
+from typing import Dict, List, Optional, Set
 
 from app.config.capacity import capacity_settings
 from app.redact import redact_stream_id
@@ -87,7 +109,13 @@ class IngestProxyManager:
         self._stream_ports: Dict[str, int] = {}
         self._procs: Dict[str, subprocess.Popen] = {}
         self._desired: Set[str] = set()
-        self._release_timers: Dict[str, threading.Timer] = {}
+        # stream_id -> time.time() of the most recent disconnect, for
+        # ANY currently-reserved stream that is not presently connected.
+        # Cleared on reconnect. Only ever read by
+        # release_stale_reservations - never used to kill anything on a
+        # short fuse (see this module's own docstring for exactly why
+        # that was tried once and reverted).
+        self._disconnected_at: Dict[str, float] = {}
 
     def allocate(self, stream_id: str, key: str) -> Optional[int]:
         """Reserve a port and start this stream's supervisor. Returns the
@@ -119,18 +147,17 @@ class IngestProxyManager:
 
     def active_count(self) -> int:
         """Number of currently-held ports - what the capacity status
-        endpoint (app/main.py's GET /capacity) reports as "in use",
-        distinct from how many are merely reserved-pending-grace-release
-        (still counted here deliberately: a slot in its disconnect grace
-        window is NOT available for a new admission, so it must still
-        read as occupied)."""
+        endpoint (app/main.py's GET /capacity) reports as "in use". A
+        stream between connections (disconnected but not yet reclaimed
+        by release_stale_reservations) still counts as occupied - it is
+        not available for a new admission."""
         with self._lock:
             return len(self._ports_in_use)
 
     def release(self, stream_id: str) -> None:
-        self._cancel_release_timer(stream_id)
         with self._lock:
             self._desired.discard(stream_id)
+            self._disconnected_at.pop(stream_id, None)
             proc = self._procs.pop(stream_id, None)
             port = self._stream_ports.pop(stream_id, None)
             if port is not None:
@@ -139,67 +166,47 @@ class IngestProxyManager:
             self._terminate(proc)
         logger.info("ingest_proxy: released %s (port=%s)", redact_stream_id(stream_id), port)
 
-    def schedule_release(self, stream_id: str) -> None:
-        """Called from app/main.py's hook_not_ready - the publisher just
-        disconnected. Does NOT release immediately (that would defeat
-        the whole point of _supervise's respawn-on-reconnect design for
-        a broadcaster whose encoder briefly drops and auto-reconnects to
-        the exact same port/key). Starts a bounded timer instead; if
-        nothing cancels it (see cancel_scheduled_release) before it
-        fires, the port is released automatically - closing the
-        permanent-capacity-leak gap this module's own docstring
-        describes, without requiring Django to ever call DELETE
-        /streams for an organic disconnect it doesn't currently react
-        to that way."""
+    def mark_disconnected(self, stream_id: str) -> None:
+        """Called from app/main.py's hook_not_ready - records WHEN the
+        publisher disconnected. Does not touch the port, the listener,
+        or _desired in any way - _supervise's own respawn loop is what
+        keeps a fresh listener ready for a reconnect, completely
+        unaffected by this. Purely a timestamp for
+        release_stale_reservations to later judge genuine abandonment
+        against."""
         with self._lock:
-            if stream_id not in self._stream_ports:
-                return  # already released, or never allocated - nothing to schedule
-            existing_timer = self._release_timers.get(stream_id)
-            if existing_timer is not None:
-                existing_timer.cancel()
-            timer = threading.Timer(
-                capacity_settings.ingest_reconnect_grace_seconds,
-                self._fire_scheduled_release,
-                args=(stream_id,),
+            if stream_id in self._stream_ports:
+                self._disconnected_at[stream_id] = time.time()
+
+    def mark_reconnected(self, stream_id: str) -> None:
+        """Called from app/main.py's hook_ready - the publisher is back.
+        Clears any disconnect timestamp so release_stale_reservations
+        never considers this stream for cleanup while it's actively
+        connected."""
+        with self._lock:
+            self._disconnected_at.pop(stream_id, None)
+
+    def release_stale_reservations(self, stale_after_seconds: float) -> List[str]:
+        """Driven by the reconciliation sweep (app/recording.py), on its
+        existing interval, using the existing RECONCILE_STALE_SECONDS
+        threshold - the single safety net for a creator who genuinely
+        abandoned a broadcast (closed OBS, never tapped "End Stream" in
+        the app, never reconnected) without permanently starving a
+        small ingest-proxy pool. Returns the list of stream_ids it
+        released, for logging/testing visibility."""
+        now = time.time()
+        with self._lock:
+            stale = [
+                stream_id for stream_id, disconnected_at in self._disconnected_at.items()
+                if now - disconnected_at >= stale_after_seconds
+            ]
+        for stream_id in stale:
+            logger.warning(
+                "ingest_proxy: releasing stale reservation for %s - disconnected for over %.0fs with no reconnect",
+                redact_stream_id(stream_id), stale_after_seconds,
             )
-            timer.daemon = True
-            self._release_timers[stream_id] = timer
-            timer.start()
-        logger.info(
-            "ingest_proxy: scheduled auto-release for %s in %.1fs if no reconnect",
-            redact_stream_id(stream_id), capacity_settings.ingest_reconnect_grace_seconds,
-        )
-
-    def cancel_scheduled_release(self, stream_id: str) -> None:
-        """Called from app/main.py's hook_ready - the publisher (re)
-        connected. If a disconnect grace timer was pending for this
-        exact stream_id, cancel it: the port is still genuinely in use,
-        not abandoned."""
-        cancelled = self._cancel_release_timer(stream_id)
-        if cancelled:
-            logger.info("ingest_proxy: cancelled pending auto-release for %s (reconnected)", redact_stream_id(stream_id))
-
-    def _cancel_release_timer(self, stream_id: str) -> bool:
-        with self._lock:
-            timer = self._release_timers.pop(stream_id, None)
-        if timer is not None:
-            timer.cancel()
-            return True
-        return False
-
-    def _fire_scheduled_release(self, stream_id: str) -> None:
-        with self._lock:
-            # The timer firing races against cancel_scheduled_release
-            # clearing it - if it's already gone from the dict, a
-            # reconnect won the race and this is a no-op, not a bug.
-            if stream_id not in self._release_timers:
-                return
-            self._release_timers.pop(stream_id, None)
-        logger.warning(
-            "ingest_proxy: auto-releasing %s - no reconnect within %.1fs of disconnect",
-            redact_stream_id(stream_id), capacity_settings.ingest_reconnect_grace_seconds,
-        )
-        self.release(stream_id)
+            self.release(stream_id)
+        return stale
 
     def shutdown(self, drain_timeout_seconds: float) -> None:
         """Called from app/main.py's shutdown event - releases every
@@ -207,11 +214,9 @@ class IngestProxyManager:
         in-memory reservations lingering for the (very short) remainder
         of this process's life. Purely defensive: this process exiting
         kills every ffmpeg child it spawned regardless, and a fresh
-        process starts with empty state anyway (see
-        app/config/capacity.py's own docstring on why in-memory state
-        never needs cross-restart recovery for a single-process
-        deployment) - this just makes the shutdown-time logs honest
-        about what's being torn down instead of silently vanishing."""
+        process starts with empty state anyway - this just makes the
+        shutdown-time logs honest about what's being torn down instead
+        of silently vanishing."""
         with self._lock:
             stream_ids = list(self._desired)
         for stream_id in stream_ids:
@@ -239,11 +244,10 @@ class IngestProxyManager:
                 if stream_id not in self._desired:
                     return
             # Falls through and loops: respawns a fresh listener
-            # immediately so a broadcaster's reconnect has somewhere to
-            # land, for as long as this stream is still desired (or
-            # until schedule_release's grace timer expires and releases
-            # it out from under this loop, at which point the next
-            # desired-check above returns).
+            # immediately so a broadcaster's reconnect - on ANY
+            # realistic human timescale, not just within a few seconds
+            # - has somewhere to land, for as long as this stream is
+            # still desired.
 
     def _spawn(self, stream_id: str, key: str, port: int) -> subprocess.Popen:
         listen_url = f"rtmp://0.0.0.0:{port}/live/{key}"

@@ -80,6 +80,7 @@ import httpx
 
 from app.config.capacity import capacity_settings
 from app.config.settings import settings
+from app.ingest_proxy import ingest_proxy_manager
 from app.redact import redact_stream_id
 
 logger = logging.getLogger(__name__)
@@ -620,6 +621,15 @@ class ReconciliationSweep:
 
     def _sweep_once(self) -> None:
         self._manager.retry_pending_uploads()
+        # Reclaims an ingest-proxy port whose broadcaster disconnected
+        # and never reconnected for a genuinely long time - the ONLY
+        # mechanism that releases a port after an organic disconnect in
+        # this codebase; see app/ingest_proxy.py's own docstring for why
+        # this deliberately reuses the same long-proven
+        # RECONCILE_STALE_SECONDS threshold instead of a separate,
+        # shorter, independently-tuned timer (which caused a real
+        # production incident the first time one was tried).
+        ingest_proxy_manager.release_stale_reservations(capacity_settings.reconcile_stale_seconds)
 
         live_root = RECORDINGS_ROOT / "live"
         if not live_root.exists():

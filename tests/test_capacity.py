@@ -58,7 +58,6 @@ class TestValidation:
     def _valid(self, **overrides) -> CapacitySettings:
         defaults = dict(
             ingest_proxy_ports=[19350],
-            ingest_reconnect_grace_seconds=8.0,
             disk_warn_free_bytes=10 * 1024**3,
             disk_critical_free_bytes=5 * 1024**3,
             disk_monitor_interval_seconds=60,
@@ -100,17 +99,6 @@ class TestValidation:
         # currently-live, still-actively-publishing stream as abandoned.
         with pytest.raises(CapacityConfigError, match="RECONCILE_STALE_SECONDS"):
             self._valid(reconcile_interval_seconds=300, reconcile_stale_seconds=300).validate()
-
-    def test_rejects_negative_reconnect_grace(self):
-        with pytest.raises(CapacityConfigError, match="INGEST_RECONNECT_GRACE_SECONDS"):
-            self._valid(ingest_reconnect_grace_seconds=-1).validate()
-
-    def test_rejects_reconnect_grace_not_less_than_reconcile_stale(self):
-        # The reconnect grace window exists to resolve well before the
-        # reconciliation sweep would separately consider the session
-        # abandoned - if it's equal or longer, the two mechanisms race.
-        with pytest.raises(CapacityConfigError, match="INGEST_RECONNECT_GRACE_SECONDS"):
-            self._valid(ingest_reconnect_grace_seconds=900, reconcile_stale_seconds=900).validate()
 
     def test_rejects_non_positive_shutdown_drain_timeout(self):
         with pytest.raises(CapacityConfigError, match="SHUTDOWN_DRAIN_TIMEOUT_SECONDS"):

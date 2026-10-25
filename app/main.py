@@ -293,14 +293,17 @@ def hook_ready(path: str = Query(...)) -> dict:
     again (no "/clean" sibling path to guard against, unlike the earlier,
     abandoned post-MediaMTX relay attempt).
 
-    Also cancels any pending disconnect-grace auto-release for this
-    exact path (see app/ingest_proxy.py's schedule_release) - this fires
-    on EVERY publisher connect, including the very first one for a
-    brand-new stream (which never had a release scheduled, so the cancel
-    is a harmless no-op) and a genuine reconnect after a brief drop
-    (where it matters)."""
+    Also clears any disconnect timestamp recorded for this path (see
+    app/ingest_proxy.py's mark_reconnected) - this fires on EVERY
+    publisher connect, including the very first one for a brand-new
+    stream (nothing to clear, harmless no-op) and a genuine reconnect
+    after a drop of any length (where it matters: it keeps this stream
+    out of release_stale_reservations' consideration while connected).
+    Deliberately does NOT use a short timer to kill anything on
+    disconnect - see app/ingest_proxy.py's own docstring for the real
+    production incident that approach caused."""
     logger.info("MediaMTX hook: /hooks/ready path=%s (publisher connected)", redact_stream_id(path))
-    ingest_proxy_manager.cancel_scheduled_release(path)
+    ingest_proxy_manager.mark_reconnected(path)
     _notify_django(path, "live", recording_status="recording")
     return {"ok": True}
 
@@ -309,19 +312,23 @@ def hook_ready(path: str = Query(...)) -> dict:
 def hook_not_ready(path: str = Query(...)) -> dict:
     """Mirrors hook_ready for runOnUnavailable (publisher stopped).
 
-    Schedules a bounded auto-release of this stream's ingest-proxy port
-    (see app/ingest_proxy.py's schedule_release docstring for the
-    permanent-capacity-leak bug this closes) rather than relying on
-    Django ever calling DELETE /streams for an organic disconnect, which
-    it does not do today - ChannelLiveStreamWebhookView (the Django-side
-    handler for the "ended" status this hook triggers via _notify_django
-    below) only updates ChannelLiveStream.status/ended_at; the explicit
-    provider.delete_live_stream() call only happens from the creator's
-    own End/Cancel actions."""
+    Records the disconnect timestamp (app/ingest_proxy.py's
+    mark_disconnected) - nothing more. The port/listener stay fully
+    reserved and running, exactly as before any of this existed; a
+    reconnect on any realistic timescale (seconds to many minutes) finds
+    a live listener waiting, same as the original pre-incident design.
+    Genuine, long-term abandonment (no reconnect ever) is instead
+    reclaimed later by the reconciliation sweep's own
+    release_stale_reservations call, on the same proven
+    RECONCILE_STALE_SECONDS threshold used elsewhere in this codebase -
+    see app/ingest_proxy.py's module docstring for exactly why a
+    separate, short, per-disconnect timer was tried here first and
+    reverted after it broke a real broadcaster's reconnect in
+    production."""
     logger.info("MediaMTX hook: /hooks/not-ready path=%s (publisher disconnected)", redact_stream_id(path))
     _notify_django(path, "ended", recording_status="finalizing")
     relay_manager.stop_all(path)
-    ingest_proxy_manager.schedule_release(path)
+    ingest_proxy_manager.mark_disconnected(path)
     # Concat/validate/upload/archive runs in a background thread - this
     # hook response must return promptly (MediaMTX is waiting on it
     # synchronously), and the whole point of recording_status=finalizing

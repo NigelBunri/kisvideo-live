@@ -125,17 +125,21 @@ class CapacitySettings:
     def max_concurrent_broadcasts(self) -> int:
         return len(self.ingest_proxy_ports)
 
-    # How long an ingest-proxy port stays reserved after MediaMTX reports
-    # the publisher disconnected (runOnUnavailable) before this service
-    # auto-releases it back to the pool - see app/ingest_proxy.py's
-    # schedule_release/cancel_scheduled_release. Long enough to cover a
-    # real OBS auto-reconnect after a brief network blip; short enough
-    # that an ungraceful disconnect (crash, app killed, creator simply
-    # closes OBS without tapping "End Stream") doesn't permanently starve
-    # a one-port pool. 8s was chosen as comfortably longer than a typical
-    # TCP reconnect/renegotiation, comfortably shorter than a human
-    # noticing and manually intervening.
-    ingest_reconnect_grace_seconds: float = 8.0
+    # NOTE: there is deliberately NO separate "disconnect grace period"
+    # setting here. A first version of this module had one
+    # (ingest_reconnect_grace_seconds, 8s default) driving a short
+    # threading.Timer that killed a disconnected broadcaster's listener
+    # if it didn't reconnect within that window - this caused a real
+    # production incident within minutes of deployment (a broadcaster
+    # who simply took longer than 8 seconds to restart OBS got "failed
+    # to connect to server," with no recovery short of a new stream
+    # key). Removed entirely, not just retuned to a bigger number - see
+    # app/ingest_proxy.py's own docstring. Stale ingest-proxy
+    # reservations are now reclaimed by release_stale_reservations,
+    # driven by the reconciliation sweep on the existing
+    # reconcile_stale_seconds threshold below (15 minutes by default) -
+    # a value with a real track record elsewhere in this codebase,
+    # not a second, shorter, independently-tuned one.
 
     # ── Disk capacity (app/disk_guard.py) ───────────────────────────────
     disk_warn_free_bytes: int = 10 * 1024 * 1024 * 1024
@@ -194,7 +198,6 @@ class CapacitySettings:
         ports = _parse_port_pool(os.environ.get("INGEST_PROXY_PORTS", "19350"))
         return cls(
             ingest_proxy_ports=ports,
-            ingest_reconnect_grace_seconds=_env_float("INGEST_RECONNECT_GRACE_SECONDS", 8.0),
             disk_warn_free_bytes=_env_int("DISK_WARN_FREE_BYTES", 10 * 1024 * 1024 * 1024),
             disk_critical_free_bytes=_env_int("DISK_CRITICAL_FREE_BYTES", 5 * 1024 * 1024 * 1024),
             disk_monitor_interval_seconds=_env_int("DISK_MONITOR_INTERVAL_SECONDS", 60),
@@ -248,15 +251,6 @@ class CapacitySettings:
                 f"RECONCILE_INTERVAL_SECONDS ({self.reconcile_interval_seconds}) - otherwise every "
                 "sweep pass would immediately treat a currently-live stream as abandoned"
             )
-        if self.ingest_reconnect_grace_seconds < 0:
-            raise CapacityConfigError("INGEST_RECONNECT_GRACE_SECONDS cannot be negative")
-        if self.ingest_reconnect_grace_seconds >= self.reconcile_stale_seconds:
-            raise CapacityConfigError(
-                f"INGEST_RECONNECT_GRACE_SECONDS ({self.ingest_reconnect_grace_seconds}) must be less than "
-                f"RECONCILE_STALE_SECONDS ({self.reconcile_stale_seconds}) - the reconnect grace window is "
-                "meant to resolve long before the reconciliation sweep would otherwise consider the "
-                "session abandoned"
-            )
         if self.shutdown_drain_timeout_seconds <= 0:
             raise CapacityConfigError("SHUTDOWN_DRAIN_TIMEOUT_SECONDS must be positive")
         if not (0 < self.measured_cpu_fraction_per_broadcast <= 8.0):
@@ -267,10 +261,10 @@ class CapacitySettings:
             raise CapacityConfigError("MEASURED_MEMORY_MB_PER_BROADCAST must be positive")
         logger.info(
             "capacity config validated: max_concurrent_broadcasts=%d ports=%s "
-            "disk_warn_gb=%.1f disk_critical_gb=%.1f reconnect_grace_s=%.1f",
+            "disk_warn_gb=%.1f disk_critical_gb=%.1f reconcile_stale_s=%.0f",
             self.max_concurrent_broadcasts, self.ingest_proxy_ports,
             self.disk_warn_free_bytes / 1e9, self.disk_critical_free_bytes / 1e9,
-            self.ingest_reconnect_grace_seconds,
+            self.reconcile_stale_seconds,
         )
 
 

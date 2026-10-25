@@ -61,7 +61,6 @@ silent misconfiguration.
 | Setting | Env var | Default | Meaning |
 |---|---|---|---|
 | Ingest port pool | `INGEST_PROXY_PORTS` | `19350` | Comma-separated list. **Length of this list IS `max_concurrent_broadcasts`** — there is no separate "concurrency limit" setting to accidentally drift out of sync with the pool. |
-| Reconnect grace period | `INGEST_RECONNECT_GRACE_SECONDS` | `8.0` | How long a disconnected publisher's port reservation survives before auto-releasing (see §4.1). |
 | Disk warn threshold | `DISK_WARN_FREE_BYTES` | `10GB` | Structured `[DiskCapacity]` WARNING log once free space drops below this. |
 | Disk critical threshold | `DISK_CRITICAL_FREE_BYTES` | `5GB` | `POST /streams` starts returning `503` once free space drops below this. Already-running recordings are never interrupted. |
 | Disk monitor interval | `DISK_MONITOR_INTERVAL_SECONDS` | `60` | How often the disk guard polls. |
@@ -192,25 +191,43 @@ a late/duplicate webhook delivery — enforced on the Django side
 terminal-state guards, confirmed via dedicated tests in
 `apps/broadcasts/test_channel_live_stream.py`).
 
-### 4.1 The disconnect-grace-release fix (this round)
+### 4.1 Disconnect handling — a real incident, and the actual fix
 
-**Previously a real, production-reachable bug**: `hook_not_ready` never
-released the ingest-proxy port — only an explicit `DELETE /streams` did,
-and Django's organic "stream ended" webhook handler
-(`ChannelLiveStreamWebhookView`) never calls that; only the creator's own
-explicit End/Cancel actions in the app do. A single ungraceful disconnect
-(OBS crash, lost network, the creator just closing the encoder without
-tapping "End Stream") permanently exhausted this service's entire
-one-port capacity until a human intervened or the container restarted.
+**Original bug**: `hook_not_ready` never released the ingest-proxy port
+on an organic disconnect — only an explicit `DELETE /streams` did, and
+Django's "stream ended" webhook handler (`ChannelLiveStreamWebhookView`)
+never calls that; only the creator's own explicit End/Cancel actions in
+the app do. A single ungraceful disconnect (OBS crash, lost network, the
+creator just closing the encoder without tapping "End Stream")
+permanently exhausted this service's entire one-port capacity until a
+human intervened or the container restarted.
 
-**Fix**: `hook_not_ready` now calls `schedule_release()` — a bounded
-timer (`INGEST_RECONNECT_GRACE_SECONDS`, default 8s), not an immediate
-release. `hook_ready` for the same stream (a genuine reconnect, which
-OBS's own auto-reconnect does routinely) calls
-`cancel_scheduled_release()`. If nothing reconnects within the grace
-window, the port releases itself automatically — no explicit `DELETE`
-required. Verified with real concurrent-thread tests in
-`tests/test_ingest_proxy.py`, not just reasoned about.
+**A first fix attempt made this worse, in real production, not better**:
+a short per-disconnect `threading.Timer` (`schedule_release`/
+`cancel_scheduled_release`, 8s default) that killed the listening
+process outright if nothing reconnected within that window. A real
+broadcaster who simply clicked "Stop Streaming" and took longer than a
+few seconds deciding to restart — the ordinary case, not an edge case —
+found their reconnect met with a dead listener and "failed to connect to
+server," with no recovery short of a brand-new stream key from the app.
+Caught from a real user's real broadcast within minutes of deployment
+(production logs: `scheduled auto-release... in 8.0s` →
+`auto-releasing... no reconnect within 8.0s`), and reverted the same
+session.
+
+**The actual fix**: no timer of any kind on the disconnect path.
+`mark_disconnected()`/`mark_reconnected()` just record a plain
+timestamp — the listener keeps running indefinitely, exactly like the
+pre-incident original behavior, for a reconnect on any human timescale.
+The only thing that ever reclaims a disconnected reservation is
+`release_stale_reservations()`, driven by the *existing* reconciliation
+sweep on the *existing* `RECONCILE_STALE_SECONDS` threshold (15 minutes
+by default) — the same value already proven elsewhere in this codebase
+for "this session is genuinely abandoned," not a second, shorter,
+independently-tuned number. Verified with tests in
+`tests/test_ingest_proxy.py` that specifically assert a disconnect alone
+never releases anything, no matter how long the test waits — the exact
+property whose absence caused the incident.
 
 ### 4.2 Idempotency and duplicate/out-of-order events
 

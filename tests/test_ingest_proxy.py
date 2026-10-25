@@ -5,10 +5,17 @@ would otherwise trigger them, since allocate() starts a real background
 thread that calls _spawn. Focuses on the two things the KIS capacity
 directive specifically asked to be verified with real tests: atomic
 admission (two requests can never claim the same port) and reservation
-release under every real-world path (explicit DELETE, disconnect grace
-expiry, reconnect cancellation, shutdown drain) - not just the happy
-path this module already had a human-reasoned docstring for.
-"""
+release under every real-world path (explicit DELETE, stale-reservation
+sweep reclaim, reconnect preserving the slot, shutdown drain) - not just
+the happy path this module already had a human-reasoned docstring for.
+
+TestStaleReservationReclaim covers the SECOND version of disconnect
+handling - a FIRST version (a short per-disconnect threading.Timer that
+killed the listener outright) caused a real production incident within
+minutes of deployment and was reverted; see app/ingest_proxy.py's own
+module docstring for the full account. These tests exist specifically
+so that incident's root cause - something auto-releasing a reservation
+on too short a fuse - cannot silently return."""
 
 from __future__ import annotations
 
@@ -24,11 +31,7 @@ from app.ingest_proxy import IngestProxyManager
 
 @pytest.fixture
 def manager(monkeypatch):
-    # Every test gets a fresh manager AND a short, deterministic grace
-    # period - the real default (8s) would make the release-related
-    # tests slow without adding any real coverage.
     monkeypatch.setattr(capacity_settings, "ingest_proxy_ports", [19350, 19351])
-    monkeypatch.setattr(capacity_settings, "ingest_reconnect_grace_seconds", 0.05)
     m = IngestProxyManager()
     # _supervise spawns a real background thread per allocate() call that
     # would otherwise try to exec a real ffmpeg - patch it to a no-op so
@@ -129,76 +132,114 @@ class TestRelease:
         assert manager.active_count() == 1
 
 
-class TestDisconnectGraceRelease:
-    """The real, previously-unverified bug this round fixed: a publisher
-    disconnecting (MediaMTX's runOnUnavailable -> app/main.py's
-    hook_not_ready) never released the ingest-proxy port on its own -
-    only an explicit DELETE /streams did, which Django's organic
-    "stream ended" webhook path never calls. With a one-port pool, a
-    single ungraceful disconnect (OBS crash, app killed, creator closes
-    the encoder without tapping "End Stream") permanently exhausted this
-    service's entire capacity. schedule_release/cancel_scheduled_release
-    close that gap with a bounded grace timer."""
+class TestDisconnectNeverKillsTheListenerOnAShortFuse:
+    """Pins down the actual fix for the real production incident: a
+    disconnect (mark_disconnected) must NEVER, by itself, on any
+    timescale within a test's reasonable patience, release the port or
+    touch the listener. The only thing allowed to reclaim a disconnected
+    reservation is release_stale_reservations, and only when explicitly
+    told to treat it as stale (see TestStaleReservationReclaim) - never
+    as a side effect of time simply passing after mark_disconnected."""
 
-    def test_scheduled_release_frees_the_port_after_the_grace_period_elapses(self, manager):
+    def test_mark_disconnected_alone_never_releases_the_port_no_matter_how_long_you_wait(self, manager):
         manager.allocate("live/a", "keya")
+        manager.mark_disconnected("live/a")
 
-        manager.schedule_release("live/a")
-        assert manager.port_for("live/a") is not None, "must not release immediately - that would defeat reconnect tolerance"
+        time.sleep(0.2)  # several times longer than the old, reverted 8s-scaled test timers ever waited in practice
 
-        time.sleep(capacity_settings.ingest_reconnect_grace_seconds + 0.1)
+        assert manager.port_for("live/a") is not None, "a disconnect must never, by itself, release the reservation"
 
-        assert manager.port_for("live/a") is None, "must auto-release once the grace period elapses with no reconnect"
+    def test_mark_disconnected_for_a_never_allocated_stream_is_a_safe_noop(self, manager):
+        manager.mark_disconnected("live/never-existed")  # must not raise
 
-    def test_cancel_scheduled_release_prevents_the_auto_release(self, manager):
+    def test_mark_reconnected_clears_the_disconnect_timestamp(self, manager):
         manager.allocate("live/a", "keya")
-        manager.schedule_release("live/a")
+        manager.mark_disconnected("live/a")
 
-        manager.cancel_scheduled_release("live/a")
-        time.sleep(capacity_settings.ingest_reconnect_grace_seconds + 0.1)
+        manager.mark_reconnected("live/a")
 
-        assert manager.port_for("live/a") is not None, "a reconnect (cancel) must keep the port reserved past the original grace window"
+        assert "live/a" not in manager._disconnected_at
 
-    def test_a_genuine_reconnect_before_the_grace_window_expires_keeps_the_slot(self, manager):
-        # End-to-end simulation of the real scenario: disconnect, then a
-        # reconnect lands (hook_ready -> cancel_scheduled_release)
-        # BEFORE the grace timer fires.
+    def test_mark_reconnected_on_a_stream_that_was_never_disconnected_is_a_safe_noop(self, manager):
         manager.allocate("live/a", "keya")
-        manager.schedule_release("live/a")
-        time.sleep(capacity_settings.ingest_reconnect_grace_seconds * 0.3)  # well before expiry
+        manager.mark_reconnected("live/a")  # must not raise
 
-        manager.cancel_scheduled_release("live/a")
-        time.sleep(capacity_settings.ingest_reconnect_grace_seconds + 0.1)
 
+class TestStaleReservationReclaim:
+    """release_stale_reservations - the actual (and only) mechanism that
+    reclaims a port after a disconnect, driven by the reconciliation
+    sweep on the long-proven RECONCILE_STALE_SECONDS threshold, not a
+    short per-disconnect timer."""
+
+    def test_releases_a_reservation_disconnected_longer_than_the_threshold(self, manager, monkeypatch):
+        manager.allocate("live/a", "keya")
+        manager.mark_disconnected("live/a")
+        # Simulate time having actually passed, rather than sleeping a
+        # real wall-clock duration in the test.
+        manager._disconnected_at["live/a"] = time.time() - 1000
+
+        released = manager.release_stale_reservations(stale_after_seconds=900)
+
+        assert released == ["live/a"]
+        assert manager.port_for("live/a") is None
+
+    def test_does_not_release_a_reservation_disconnected_less_than_the_threshold(self, manager):
+        manager.allocate("live/a", "keya")
+        manager.mark_disconnected("live/a")
+        manager._disconnected_at["live/a"] = time.time() - 10  # well under any realistic threshold
+
+        released = manager.release_stale_reservations(stale_after_seconds=900)
+
+        assert released == []
         assert manager.port_for("live/a") is not None
 
-    def test_scheduling_release_for_an_unallocated_stream_is_a_safe_noop(self, manager):
-        manager.schedule_release("live/never-existed")  # must not raise
-        time.sleep(capacity_settings.ingest_reconnect_grace_seconds + 0.1)
-        # Nothing to assert beyond "did not raise" - there was never a
-        # reservation to release.
-
-    def test_explicit_delete_during_the_grace_window_also_cancels_the_timer(self, manager):
-        # An explicit DELETE arriving while a disconnect-grace timer is
-        # already pending (e.g. the creator taps "End Stream" right
-        # after their encoder drops) must not leave a dangling timer
-        # that fires a redundant (harmless, but untidy) release later.
+    def test_does_not_release_a_reservation_that_is_currently_connected(self, manager):
+        # allocate() alone never marks anything disconnected - a stream
+        # with no entry in _disconnected_at at all (the normal state
+        # for an actively-publishing broadcast) must never be touched.
         manager.allocate("live/a", "keya")
-        manager.schedule_release("live/a")
 
-        manager.release("live/a")
+        released = manager.release_stale_reservations(stale_after_seconds=900)
 
-        assert manager._release_timers.get("live/a") is None
+        assert released == []
+        assert manager.port_for("live/a") is not None
 
-    def test_reallocating_after_auto_release_gets_a_fresh_port(self, manager):
+    def test_a_reconnect_before_the_sweep_runs_prevents_reclaim_entirely(self, manager):
+        # The real end-to-end scenario: disconnect, then a genuine
+        # reconnect (hook_ready -> mark_reconnected) lands before the
+        # reconciliation sweep ever gets a chance to consider this
+        # stream stale - exactly the case that broke in production
+        # under the old short-timer design.
         manager.allocate("live/a", "keya")
-        manager.schedule_release("live/a")
-        time.sleep(capacity_settings.ingest_reconnect_grace_seconds + 0.1)
+        manager.mark_disconnected("live/a")
+        manager.mark_reconnected("live/a")
 
-        # The pool slot is free again - a brand new POST /streams (new
-        # stream_id, since Django would issue a fresh key) can claim it.
-        new_port = manager.allocate("live/fresh", "freshkey")
-        assert new_port is not None
+        # Even if the sweep runs with a threshold that would have
+        # matched the (now-cleared) old disconnect timestamp, there's
+        # nothing left to reclaim.
+        released = manager.release_stale_reservations(stale_after_seconds=0)
+
+        assert released == []
+        assert manager.port_for("live/a") is not None
+
+    def test_releases_multiple_stale_reservations_in_one_pass(self, manager):
+        manager.allocate("live/a", "keya")
+        manager.allocate("live/b", "keyb")
+        manager.mark_disconnected("live/a")
+        manager.mark_disconnected("live/b")
+        manager._disconnected_at["live/a"] = time.time() - 1000
+        manager._disconnected_at["live/b"] = time.time() - 1000
+
+        released = manager.release_stale_reservations(stale_after_seconds=900)
+
+        assert sorted(released) == ["live/a", "live/b"]
+
+    def test_empty_when_nothing_is_disconnected(self, manager):
+        manager.allocate("live/a", "keya")
+
+        released = manager.release_stale_reservations(stale_after_seconds=0)
+
+        assert released == []
 
 
 class TestShutdownDrain:
